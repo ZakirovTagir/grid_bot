@@ -1,0 +1,7 @@
+pybit==5.14.0
+python-telegram-bot==22.5
+pandas==2.3.3
+numpy==2.0.2
+python-dotenv==1.2.1
+PyYAML==6.0.3
+yadisk==3.4.1

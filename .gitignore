@@ -1,0 +1,28 @@
+# Служебные файлы Visual Studio
+.vs/
+
+# Файлы окружения (токены, ключи)
+.env
+
+# Кэш и скомпилированные файлы Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Логи
+*.log
+
+# Тестовые скрипты (не нужны на VPS)
+find_swing_points.py
+test_*.py
+
+# Исторические данные
+data/historical/
+
+# Архивы
+*.zip
+*.tar.gz
+
+# Настройки IDE
+.vscode/
+.idea/

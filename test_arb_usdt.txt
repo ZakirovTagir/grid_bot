@@ -1,0 +1,460 @@
+timestamp,event,price,trend_type,details
+2025-12-09 22:00:00,макс1,0.22,SHORT,
+2025-12-10 09:00:00,мин1,0.22,SHORT,
+2025-12-10 10:00:00,макс2,0.22,SHORT,
+2025-12-10 13:00:00,entry,0.22,SHORT,stop_loss:0.22, qty:714.285714, pos_value:156.89, parts:1, expected_profit:8.71 USDT
+2025-12-10 14:00:00,breakeven_activated,0.22,SHORT,
+2025-12-10 15:00:00,exit,0.22,SHORT,reason: breakeven_stop, PnL:0.40 USDT, баланс:1000.40
+2025-12-11 20:00:00,мин1,0.21,LONG,
+2025-12-12 00:00:00,макс1,0.22,LONG,
+2025-12-12 04:00:00,мин2,0.21,LONG,
+2025-12-12 09:00:00,entry,0.21,LONG,stop_loss:0.21, qty:582.524272, pos_value:124.43, parts:1, expected_profit:7.66 USDT
+2025-12-12 14:00:00,breakeven_activated,0.21,LONG,
+2025-12-12 14:00:00,exit,0.21,LONG,reason: breakeven_stop, PnL:0.33 USDT, баланс:1000.73
+2025-12-16 10:00:00,мин1,0.19,LONG,
+2025-12-16 17:00:00,макс1,0.20,LONG,
+2025-12-16 19:00:00,мин2,0.20,LONG,
+2025-12-16 23:00:00,entry,0.20,LONG,stop_loss:0.20, qty:598.172251, pos_value:120.00, parts:1, expected_profit:8.02 USDT
+2025-12-17 09:00:00,exit,0.20,LONG,reason: stop_loss, PnL:-3.24 USDT, баланс:997.50
+2025-12-21 22:00:00,мин1,0.18,LONG,
+2025-12-22 13:00:00,макс1,0.19,LONG,
+2025-12-22 20:00:00,мин2,0.18,LONG,
+2025-12-22 23:00:00,entry,0.18,LONG,stop_loss:0.18, qty:689.655172, pos_value:127.33, parts:1, expected_profit:8.52 USDT
+2025-12-23 00:00:00,breakeven_activated,0.19,LONG,
+2025-12-23 03:00:00,exit,0.19,LONG,reason: breakeven_stop, PnL:0.43 USDT, баланс:997.93
+2025-12-24 01:00:00,макс1,0.19,SHORT,
+2025-12-24 13:00:00,мин1,0.18,SHORT,
+2025-12-24 17:00:00,макс2,0.19,SHORT,
+2025-12-24 21:00:00,entry,0.19,SHORT,stop_loss:0.19, qty:652.173913, pos_value:122.79, parts:1, expected_profit:8.22 USDT
+2025-12-25 10:00:00,breakeven_activated,0.19,SHORT,
+2025-12-25 10:00:00,exit,0.19,SHORT,reason: breakeven_stop, PnL:0.41 USDT, баланс:998.34
+2025-12-26 16:00:00,мин1,0.19,LONG,
+2025-12-27 02:00:00,макс1,0.19,LONG,
+2025-12-27 09:00:00,мин2,0.19,LONG,
+2025-12-27 12:00:00,entry,0.19,LONG,stop_loss:0.19, qty:821.917808, pos_value:157.84, parts:1, expected_profit:9.58 USDT
+2025-12-27 17:00:00,breakeven_activated,0.19,LONG,
+2025-12-27 18:00:00,exit,0.19,LONG,reason: breakeven_stop, PnL:0.51 USDT, баланс:998.84
+2025-12-29 06:00:00,макс1,0.20,SHORT,
+2025-12-29 12:00:00,мин1,0.19,SHORT,
+2025-12-29 15:00:00,макс2,0.19,SHORT,
+2025-12-29 19:00:00,entry,0.19,SHORT,stop_loss:0.20, qty:652.173913, pos_value:124.26, parts:1, expected_profit:8.22 USDT
+2025-12-30 00:00:00,breakeven_activated,0.19,SHORT,
+2025-12-30 00:00:00,exit,0.19,SHORT,reason: breakeven_stop, PnL:0.40 USDT, баланс:999.25
+2025-12-30 16:00:00,макс1,0.19,SHORT,
+2025-12-31 00:00:00,мин1,0.19,SHORT,
+2025-12-31 01:00:00,макс2,0.19,SHORT,
+2025-12-31 04:00:00,entry,0.19,SHORT,stop_loss:0.19, qty:1224.489796, pos_value:235.14, parts:1, expected_profit:12.80 USDT
+2025-12-31 09:00:00,breakeven_activated,0.19,SHORT,
+2025-12-31 11:00:00,exit,0.19,SHORT,reason: breakeven_stop, PnL:0.76 USDT, баланс:1000.00
+2025-12-31 12:00:00,макс1,0.19,SHORT,
+2025-12-31 16:00:00,мин1,0.18,SHORT,
+2025-12-31 21:00:00,макс2,0.19,SHORT,
+2026-01-01 01:00:00,entry,0.19,SHORT,stop_loss:0.19, qty:789.473684, pos_value:147.54, parts:1, expected_profit:9.32 USDT
+2026-01-01 06:00:00,breakeven_activated,0.19,SHORT,
+2026-01-01 06:00:00,exit,0.19,SHORT,reason: breakeven_stop, PnL:0.50 USDT, баланс:1000.50
+2026-01-03 08:00:00,мин1,0.20,LONG,
+2026-01-04 03:00:00,макс1,0.21,LONG,
+2026-01-04 06:00:00,мин2,0.21,LONG,
+2026-01-04 11:00:00,entry,0.21,LONG,stop_loss:0.21, qty:659.340659, pos_value:138.42, parts:1, expected_profit:8.27 USDT
+2026-01-04 12:00:00,breakeven_activated,0.21,LONG,
+2026-01-05 20:00:00,exit_part1,0.22,LONG,reason: target, PnL:8.13 USDT, баланс:1008.49
+2026-01-05 20:00:00,exit,0.22,LONG,reason: all_targets_closed, PnL:7.99 USDT, баланс:1008.49
+2026-01-06 18:00:00,мин1,0.21,LONG,
+2026-01-06 21:00:00,макс1,0.22,LONG,
+2026-01-07 02:00:00,мин2,0.22,LONG,
+2026-01-07 07:00:00,entry,0.22,LONG,stop_loss:0.21, qty:550.806128, pos_value:120.00, parts:1, expected_profit:7.88 USDT
+2026-01-07 08:00:00,breakeven_activated,0.22,LONG,
+2026-01-07 09:00:00,exit,0.22,LONG,reason: breakeven_stop, PnL:0.31 USDT, баланс:1008.80
+2026-01-07 11:00:00,макс1,0.22,SHORT,
+2026-01-08 14:00:00,мин1,0.20,SHORT,
+2026-01-08 15:00:00,макс2,0.21,SHORT,
+2026-01-08 20:00:00,entry,0.21,SHORT,stop_loss:0.22, qty:568.710753, pos_value:120.00, parts:1, expected_profit:9.04 USDT
+2026-01-08 21:00:00,breakeven_activated,0.21,SHORT,
+2026-01-08 22:00:00,exit,0.21,SHORT,reason: breakeven_stop, PnL:0.33 USDT, баланс:1009.13
+2026-01-10 13:00:00,макс1,0.21,SHORT,
+2026-01-10 22:00:00,мин1,0.21,SHORT,
+2026-01-11 02:00:00,макс2,0.21,SHORT,
+2026-01-11 06:00:00,entry,0.21,SHORT,stop_loss:0.21, qty:895.522388, pos_value:184.97, parts:1, expected_profit:10.16 USDT
+2026-01-11 12:00:00,exit,0.21,SHORT,reason: stop_loss, PnL:-3.37 USDT, баланс:1005.76
+2026-01-11 23:00:00,мин1,0.20,LONG,
+2026-01-12 03:00:00,макс1,0.21,LONG,
+2026-01-12 08:00:00,мин2,0.20,LONG,
+2026-01-12 11:00:00,entry,0.20,LONG,stop_loss:0.20, qty:595.139693, pos_value:120.00, parts:1, expected_profit:7.86 USDT
+2026-01-12 15:00:00,breakeven_activated,0.20,LONG,
+2026-01-12 15:00:00,exit,0.20,LONG,reason: breakeven_stop, PnL:0.35 USDT, баланс:1006.11
+2026-01-15 14:00:00,макс1,0.22,SHORT,
+2026-01-15 19:00:00,мин1,0.20,SHORT,
+2026-01-16 00:00:00,макс2,0.21,SHORT,
+2026-01-16 03:00:00,entry,0.21,SHORT,stop_loss:0.21, qty:577.444998, pos_value:120.00, parts:1, expected_profit:8.55 USDT
+2026-01-16 15:00:00,breakeven_activated,0.21,SHORT,
+2026-01-16 15:00:00,exit,0.21,SHORT,reason: breakeven_stop, PnL:0.34 USDT, баланс:1006.45
+2026-01-19 14:00:00,мин1,0.19,LONG,
+2026-01-19 19:00:00,макс1,0.20,LONG,
+2026-01-19 23:00:00,мин2,0.19,LONG,
+2026-01-20 03:00:00,entry,0.19,LONG,stop_loss:0.19, qty:796.812749, pos_value:152.45, parts:1, expected_profit:9.37 USDT
+2026-01-20 08:00:00,exit,0.19,LONG,reason: stop_loss, PnL:-3.30 USDT, баланс:1003.15
+2026-01-20 12:00:00,макс1,0.19,SHORT,
+2026-01-20 23:00:00,мин1,0.18,SHORT,
+2026-01-21 05:00:00,макс2,0.19,SHORT,
+2026-01-21 08:00:00,entry,0.19,SHORT,stop_loss:0.19, qty:642.222341, pos_value:120.00, parts:1, expected_profit:8.20 USDT
+2026-01-21 10:00:00,breakeven_activated,0.19,SHORT,
+2026-01-21 14:00:00,exit,0.19,SHORT,reason: breakeven_stop, PnL:0.40 USDT, баланс:1003.55
+2026-01-21 18:00:00,мин1,0.18,LONG,
+2026-01-21 20:00:00,макс1,0.19,LONG,
+2026-01-21 23:00:00,мин2,0.18,LONG,
+2026-01-22 04:00:00,entry,0.19,LONG,stop_loss:0.18, qty:640.957163, pos_value:120.00, parts:1, expected_profit:8.31 USDT
+2026-01-22 06:00:00,exit,0.18,LONG,reason: stop_loss, PnL:-3.24 USDT, баланс:1000.31
+2026-01-23 04:00:00,макс1,0.18,SHORT,
+2026-01-23 14:00:00,мин1,0.17,SHORT,
+2026-01-23 19:00:00,макс2,0.18,SHORT,
+2026-01-24 00:00:00,entry,0.18,SHORT,stop_loss:0.18, qty:733.496333, pos_value:131.89, parts:1, expected_profit:8.87 USDT
+2026-01-24 01:00:00,breakeven_activated,0.18,SHORT,
+2026-01-24 03:00:00,exit,0.18,SHORT,reason: breakeven_stop, PnL:0.47 USDT, баланс:1000.78
+2026-01-24 04:00:00,макс1,0.18,SHORT,
+2026-01-24 20:00:00,мин1,0.18,SHORT,
+2026-01-24 22:00:00,макс2,0.18,SHORT,
+2026-01-25 01:00:00,entry,0.18,SHORT,stop_loss:0.18, qty:1079.136691, pos_value:190.62, parts:1, expected_profit:11.63 USDT
+2026-01-25 06:00:00,breakeven_activated,0.18,SHORT,
+2026-01-25 09:00:00,exit,0.18,SHORT,reason: breakeven_stop, PnL:0.70 USDT, баланс:1001.48
+2026-01-25 11:00:00,макс1,0.18,SHORT,
+2026-01-25 19:00:00,мин1,0.16,SHORT,
+2026-01-26 01:00:00,макс2,0.17,SHORT,
+2026-01-26 06:00:00,entry,0.17,SHORT,stop_loss:0.17, qty:708.069037, pos_value:120.00, parts:1, expected_profit:10.34 USDT
+2026-01-26 16:00:00,breakeven_activated,0.17,SHORT,
+2026-01-26 16:00:00,exit,0.17,SHORT,reason: breakeven_stop, PnL:0.47 USDT, баланс:1001.95
+2026-01-31 23:00:00,мин1,0.14,LONG,
+2026-02-01 03:00:00,макс1,0.14,LONG,
+2026-02-01 10:00:00,мин2,0.14,LONG,
+2026-02-01 13:00:00,entry,0.14,LONG,stop_loss:0.14, qty:1530.612245, pos_value:210.96, parts:1, expected_profit:15.24 USDT
+2026-02-01 15:00:00,exit,0.14,LONG,reason: stop_loss, PnL:-3.42 USDT, баланс:998.53
+2026-02-02 15:00:00,макс1,0.14,SHORT,
+2026-02-03 03:00:00,мин1,0.13,SHORT,
+2026-02-03 04:00:00,макс2,0.14,SHORT,
+2026-02-03 09:00:00,entry,0.14,SHORT,stop_loss:0.14, qty:877.676632, pos_value:120.00, parts:1, expected_profit:10.14 USDT
+2026-02-03 14:00:00,breakeven_activated,0.14,SHORT,
+2026-02-03 14:00:00,exit,0.14,SHORT,reason: breakeven_stop, PnL:0.64 USDT, баланс:999.17
+2026-02-03 18:00:00,мин1,0.12,LONG,
+2026-02-03 21:00:00,макс1,0.14,LONG,
+2026-02-04 00:00:00,мин2,0.13,LONG,
+2026-02-04 04:00:00,entry,0.13,LONG,stop_loss:0.13, qty:901.126408, pos_value:120.00, parts:1, expected_profit:12.44 USDT
+2026-02-04 09:00:00,breakeven_activated,0.13,LONG,
+2026-02-04 11:00:00,exit,0.13,LONG,reason: breakeven_stop, PnL:0.66 USDT, баланс:999.83
+2026-02-08 15:00:00,макс1,0.12,SHORT,
+2026-02-08 16:00:00,мин1,0.11,SHORT,
+2026-02-09 03:00:00,макс2,0.12,SHORT,
+2026-02-09 06:00:00,entry,0.12,SHORT,stop_loss:0.12, qty:1321.585903, pos_value:155.21, parts:1, expected_profit:13.57 USDT
+2026-02-09 07:00:00,breakeven_activated,0.12,SHORT,
+2026-02-11 06:00:00,exit_part1,0.11,SHORT,reason: target, PnL:13.43 USDT, баланс:1013.11
+2026-02-11 06:00:00,exit,0.11,SHORT,reason: all_targets_closed, PnL:13.28 USDT, баланс:1013.11
+2026-02-12 11:00:00,макс1,0.11,SHORT,
+2026-02-12 18:00:00,мин1,0.11,SHORT,
+2026-02-13 00:00:00,макс2,0.11,SHORT,
+2026-02-13 03:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1167.315175, pos_value:130.66, parts:1, expected_profit:12.34 USDT
+2026-02-13 04:00:00,breakeven_activated,0.11,SHORT,
+2026-02-13 08:00:00,exit,0.11,SHORT,reason: breakeven_stop, PnL:0.91 USDT, баланс:1014.01
+2026-02-13 13:00:00,мин1,0.11,LONG,
+2026-02-13 21:00:00,макс1,0.12,LONG,
+2026-02-14 00:00:00,мин2,0.11,LONG,
+2026-02-14 05:00:00,entry,0.12,LONG,stop_loss:0.11, qty:1025.864213, pos_value:120.00, parts:1, expected_profit:11.71 USDT
+2026-02-14 11:00:00,breakeven_activated,0.12,LONG,
+2026-02-14 11:00:00,exit,0.12,LONG,reason: breakeven_stop, PnL:0.78 USDT, баланс:1014.80
+2026-02-14 20:00:00,макс1,0.12,SHORT,
+2026-02-15 17:00:00,мин1,0.11,SHORT,
+2026-02-16 05:00:00,макс2,0.12,SHORT,
+2026-02-16 08:00:00,entry,0.11,SHORT,stop_loss:0.12, qty:1048.059898, pos_value:120.00, parts:1, expected_profit:13.48 USDT
+2026-02-16 13:00:00,breakeven_activated,0.11,SHORT,
+2026-02-16 13:00:00,exit,0.11,SHORT,reason: breakeven_stop, PnL:0.81 USDT, баланс:1015.61
+2026-02-18 10:00:00,макс1,0.11,SHORT,
+2026-02-19 00:00:00,мин1,0.11,SHORT,
+2026-02-19 02:00:00,макс2,0.11,SHORT,
+2026-02-19 05:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1116.175240, pos_value:120.00, parts:1, expected_profit:12.86 USDT
+2026-02-19 08:00:00,breakeven_activated,0.11,SHORT,
+2026-02-20 05:00:00,exit_part1,0.10,SHORT,reason: target, PnL:12.75 USDT, баланс:1028.24
+2026-02-20 05:00:00,exit,0.10,SHORT,reason: all_targets_closed, PnL:12.63 USDT, баланс:1028.24
+2026-02-20 06:00:00,макс1,0.10,SHORT,
+2026-02-20 13:00:00,мин1,0.09,SHORT,
+2026-02-20 15:00:00,макс2,0.10,SHORT,
+2026-02-20 19:00:00,entry,0.10,SHORT,stop_loss:0.10, qty:1228.068181, pos_value:120.00, parts:1, expected_profit:12.97 USDT
+2026-02-21 00:00:00,breakeven_activated,0.10,SHORT,
+2026-02-21 00:00:00,exit,0.10,SHORT,reason: breakeven_stop, PnL:0.99 USDT, баланс:1029.23
+2026-02-21 04:00:00,мин1,0.10,LONG,
+2026-02-21 10:00:00,макс1,0.10,LONG,
+2026-02-21 20:00:00,мин2,0.10,LONG,
+2026-02-21 23:00:00,entry,0.10,LONG,stop_loss:0.10, qty:1218.343687, pos_value:120.00, parts:1, expected_profit:14.65 USDT
+2026-02-22 03:00:00,exit,0.10,LONG,reason: stop_loss, PnL:-3.24 USDT, баланс:1025.99
+2026-02-22 11:00:00,макс1,0.10,SHORT,
+2026-02-22 20:00:00,мин1,0.09,SHORT,
+2026-02-23 00:00:00,макс2,0.09,SHORT,
+2026-02-23 03:00:00,entry,0.09,SHORT,stop_loss:0.10, qty:1714.285714, pos_value:161.47, parts:1, expected_profit:16.71 USDT
+2026-02-23 04:00:00,breakeven_activated,0.09,SHORT,
+2026-02-23 06:00:00,exit,0.09,SHORT,reason: breakeven_stop, PnL:1.39 USDT, баланс:1027.38
+2026-02-23 14:00:00,макс1,0.09,SHORT,
+2026-02-24 14:00:00,мин1,0.09,SHORT,
+2026-02-24 17:00:00,макс2,0.09,SHORT,
+2026-02-24 20:00:00,entry,0.09,SHORT,stop_loss:0.10, qty:1278.984392, pos_value:120.00, parts:1, expected_profit:13.36 USDT
+2026-02-25 01:00:00,breakeven_activated,0.09,SHORT,
+2026-02-25 01:00:00,exit,0.09,SHORT,reason: breakeven_stop, PnL:1.04 USDT, баланс:1028.42
+2026-02-25 11:00:00,мин1,0.09,LONG,
+2026-02-25 22:00:00,макс1,0.11,LONG,
+2026-02-26 02:00:00,мин2,0.10,LONG,
+2026-02-26 05:00:00,entry,0.10,LONG,stop_loss:0.10, qty:1209.336074, pos_value:120.00, parts:1, expected_profit:17.06 USDT
+2026-02-26 10:00:00,breakeven_activated,0.10,LONG,
+2026-02-26 10:00:00,exit,0.10,LONG,reason: breakeven_stop, PnL:0.97 USDT, баланс:1029.39
+2026-03-01 02:00:00,макс1,0.11,SHORT,
+2026-03-01 20:00:00,мин1,0.10,SHORT,
+2026-03-02 03:00:00,макс2,0.10,SHORT,
+2026-03-02 06:00:00,entry,0.10,SHORT,stop_loss:0.10, qty:1177.629745, pos_value:120.00, parts:1, expected_profit:15.00 USDT
+2026-03-02 07:00:00,breakeven_activated,0.10,SHORT,
+2026-03-02 11:00:00,exit,0.10,SHORT,reason: breakeven_stop, PnL:0.94 USDT, баланс:1030.33
+2026-03-03 10:00:00,мин1,0.10,LONG,
+2026-03-03 20:00:00,макс1,0.10,LONG,
+2026-03-03 21:00:00,мин2,0.10,LONG,
+2026-03-04 00:00:00,entry,0.10,LONG,stop_loss:0.10, qty:1279.317697, pos_value:130.67, parts:1, expected_profit:13.23 USDT
+2026-03-04 07:00:00,breakeven_activated,0.10,LONG,
+2026-03-04 07:00:00,exit,0.10,LONG,reason: breakeven_stop, PnL:1.02 USDT, баланс:1031.35
+2026-03-04 22:00:00,макс1,0.11,SHORT,
+2026-03-05 07:00:00,мин1,0.10,SHORT,
+2026-03-05 10:00:00,макс2,0.11,SHORT,
+2026-03-05 13:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1360.544218, pos_value:143.04, parts:1, expected_profit:13.88 USDT
+2026-03-05 16:00:00,breakeven_activated,0.10,SHORT,
+2026-03-05 20:00:00,exit,0.10,SHORT,reason: breakeven_stop, PnL:1.08 USDT, баланс:1032.42
+2026-03-06 11:00:00,макс1,0.10,SHORT,
+2026-03-06 18:00:00,мин1,0.10,SHORT,
+2026-03-06 19:00:00,макс2,0.10,SHORT,
+2026-03-07 00:00:00,entry,0.10,SHORT,stop_loss:0.10, qty:1214.559532, pos_value:120.00, parts:1, expected_profit:13.01 USDT
+2026-03-07 14:00:00,breakeven_activated,0.10,SHORT,
+2026-03-07 14:00:00,exit,0.10,SHORT,reason: breakeven_stop, PnL:0.98 USDT, баланс:1033.40
+2026-03-13 14:00:00,макс1,0.11,SHORT,
+2026-03-14 09:00:00,мин1,0.10,SHORT,
+2026-03-14 13:00:00,макс2,0.10,SHORT,
+2026-03-14 16:00:00,entry,0.10,SHORT,stop_loss:0.10, qty:1199.937395, pos_value:120.00, parts:1, expected_profit:14.58 USDT
+2026-03-15 02:00:00,exit,0.10,SHORT,reason: stop_loss, PnL:-3.24 USDT, баланс:1030.16
+2026-03-16 22:00:00,макс1,0.11,SHORT,
+2026-03-17 04:00:00,мин1,0.11,SHORT,
+2026-03-17 14:00:00,макс2,0.11,SHORT,
+2026-03-17 17:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1301.518438, pos_value:141.48, parts:1, expected_profit:13.41 USDT
+2026-03-18 00:00:00,breakeven_activated,0.11,SHORT,
+2026-03-18 00:00:00,exit,0.11,SHORT,reason: breakeven_stop, PnL:1.02 USDT, баланс:1031.18
+2026-03-18 10:00:00,макс1,0.11,SHORT,
+2026-03-18 17:00:00,мин1,0.10,SHORT,
+2026-03-18 21:00:00,макс2,0.10,SHORT,
+2026-03-19 00:00:00,entry,0.10,SHORT,stop_loss:0.10, qty:1176.690824, pos_value:120.00, parts:1, expected_profit:13.81 USDT
+2026-03-19 07:00:00,breakeven_activated,0.10,SHORT,
+2026-03-19 07:00:00,exit,0.10,SHORT,reason: breakeven_stop, PnL:0.94 USDT, баланс:1032.11
+2026-03-19 09:00:00,макс1,0.10,SHORT,
+2026-03-19 17:00:00,мин1,0.10,SHORT,
+2026-03-19 19:00:00,макс2,0.10,SHORT,
+2026-03-19 22:00:00,entry,0.10,SHORT,stop_loss:0.10, qty:1643.835616, pos_value:162.74, parts:1, expected_profit:16.15 USDT
+2026-03-20 05:00:00,exit,0.10,SHORT,reason: stop_loss, PnL:-3.33 USDT, баланс:1028.79
+2026-03-23 18:00:00,мин1,0.09,LONG,
+2026-03-24 00:00:00,макс1,0.10,LONG,
+2026-03-24 01:00:00,мин2,0.10,LONG,
+2026-03-24 07:00:00,entry,0.10,LONG,stop_loss:0.09, qty:1612.903226, pos_value:154.71, parts:1, expected_profit:15.90 USDT
+2026-03-24 12:00:00,breakeven_activated,0.10,LONG,
+2026-03-24 12:00:00,exit,0.10,LONG,reason: breakeven_stop, PnL:1.30 USDT, баланс:1030.09
+2026-03-26 00:00:00,макс1,0.10,SHORT,
+2026-03-26 09:00:00,мин1,0.09,SHORT,
+2026-03-26 13:00:00,макс2,0.10,SHORT,
+2026-03-26 16:00:00,entry,0.09,SHORT,stop_loss:0.10, qty:1269.087152, pos_value:120.00, parts:1, expected_profit:13.58 USDT
+2026-03-27 08:00:00,breakeven_activated,0.09,SHORT,
+2026-03-27 08:00:00,exit,0.09,SHORT,reason: breakeven_stop, PnL:1.03 USDT, баланс:1031.12
+2026-03-27 09:00:00,макс1,0.09,SHORT,
+2026-03-27 19:00:00,мин1,0.09,SHORT,
+2026-03-27 21:00:00,макс2,0.09,SHORT,
+2026-03-28 00:00:00,entry,0.09,SHORT,stop_loss:0.09, qty:1379.310345, pos_value:123.77, parts:1, expected_profit:14.03 USDT
+2026-03-28 13:00:00,exit,0.09,SHORT,reason: stop_loss, PnL:-3.25 USDT, баланс:1027.87
+2026-03-29 22:00:00,мин1,0.09,LONG,
+2026-03-30 13:00:00,макс1,0.09,LONG,
+2026-03-30 18:00:00,мин2,0.09,LONG,
+2026-03-30 21:00:00,entry,0.09,LONG,stop_loss:0.09, qty:1317.132602, pos_value:120.00, parts:1, expected_profit:15.86 USDT
+2026-03-31 02:00:00,breakeven_activated,0.09,LONG,
+2026-03-31 08:00:00,exit,0.09,LONG,reason: breakeven_stop, PnL:1.08 USDT, баланс:1028.94
+2026-03-31 09:00:00,мин1,0.09,LONG,
+2026-03-31 14:00:00,макс1,0.09,LONG,
+2026-03-31 16:00:00,мин2,0.09,LONG,
+2026-03-31 22:00:00,entry,0.09,LONG,stop_loss:0.09, qty:2173.913043, pos_value:199.21, parts:1, expected_profit:20.39 USDT
+2026-04-01 03:00:00,breakeven_activated,0.09,LONG,
+2026-04-01 03:00:00,exit,0.09,LONG,reason: breakeven_stop, PnL:1.77 USDT, баланс:1030.72
+2026-04-01 04:00:00,мин1,0.09,LONG,
+2026-04-01 08:00:00,макс1,0.10,LONG,
+2026-04-01 15:00:00,мин2,0.09,LONG,
+2026-04-01 18:00:00,entry,0.09,LONG,stop_loss:0.09, qty:1892.744479, pos_value:178.15, parts:1, expected_profit:18.14 USDT
+2026-04-02 00:00:00,breakeven_activated,0.10,LONG,
+2026-04-02 00:00:00,exit,0.10,LONG,reason: breakeven_stop, PnL:1.53 USDT, баланс:1032.25
+2026-04-02 01:00:00,макс1,0.10,SHORT,
+2026-04-02 14:00:00,мин1,0.09,SHORT,
+2026-04-02 17:00:00,макс2,0.09,SHORT,
+2026-04-02 21:00:00,entry,0.09,SHORT,stop_loss:0.09, qty:1306.477953, pos_value:120.00, parts:1, expected_profit:13.88 USDT
+2026-04-03 02:00:00,breakeven_activated,0.09,SHORT,
+2026-04-03 02:00:00,exit,0.09,SHORT,reason: breakeven_stop, PnL:1.07 USDT, баланс:1033.32
+2026-04-07 19:00:00,мин1,0.09,LONG,
+2026-04-08 04:00:00,макс1,0.10,LONG,
+2026-04-08 14:00:00,мин2,0.10,LONG,
+2026-04-08 17:00:00,entry,0.10,LONG,stop_loss:0.10, qty:1197.101754, pos_value:120.00, parts:1, expected_profit:15.04 USDT
+2026-04-08 21:00:00,breakeven_activated,0.10,LONG,
+2026-04-09 01:00:00,exit,0.10,LONG,reason: breakeven_stop, PnL:0.96 USDT, баланс:1034.27
+2026-04-09 14:00:00,мин1,0.10,LONG,
+2026-04-10 04:00:00,макс1,0.11,LONG,
+2026-04-10 06:00:00,мин2,0.11,LONG,
+2026-04-10 12:00:00,entry,0.11,LONG,stop_loss:0.11, qty:1085.027747, pos_value:120.00, parts:1, expected_profit:14.67 USDT
+2026-04-10 19:00:00,breakeven_activated,0.11,LONG,
+2026-04-10 19:00:00,exit,0.11,LONG,reason: breakeven_stop, PnL:0.84 USDT, баланс:1035.12
+2026-04-11 19:00:00,макс1,0.12,SHORT,
+2026-04-12 09:00:00,мин1,0.11,SHORT,
+2026-04-12 13:00:00,макс2,0.11,SHORT,
+2026-04-12 16:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1075.381238, pos_value:120.00, parts:1, expected_profit:13.42 USDT
+2026-04-12 22:00:00,breakeven_activated,0.11,SHORT,
+2026-04-12 22:00:00,exit,0.11,SHORT,reason: breakeven_stop, PnL:0.84 USDT, баланс:1035.95
+2026-04-15 00:00:00,мин1,0.11,LONG,
+2026-04-15 05:00:00,макс1,0.11,LONG,
+2026-04-15 08:00:00,мин2,0.11,LONG,
+2026-04-15 13:00:00,entry,0.11,LONG,stop_loss:0.11, qty:1304.347826, pos_value:146.11, parts:1, expected_profit:13.43 USDT
+2026-04-15 14:00:00,breakeven_activated,0.11,LONG,
+2026-04-15 14:00:00,exit,0.11,LONG,reason: breakeven_stop, PnL:1.01 USDT, баланс:1036.97
+2026-04-16 20:00:00,макс1,0.13,SHORT,
+2026-04-17 01:00:00,мин1,0.13,SHORT,
+2026-04-17 06:00:00,макс2,0.13,SHORT,
+2026-04-17 09:00:00,entry,0.13,SHORT,stop_loss:0.13, qty:912.075885, pos_value:120.00, parts:1, expected_profit:10.55 USDT
+2026-04-17 12:00:00,exit,0.13,SHORT,reason: stop_loss, PnL:-3.24 USDT, баланс:1033.72
+2026-04-17 13:00:00,макс1,0.14,SHORT,
+2026-04-18 03:00:00,мин1,0.13,SHORT,
+2026-04-18 08:00:00,макс2,0.13,SHORT,
+2026-04-18 11:00:00,entry,0.13,SHORT,stop_loss:0.14, qty:900.669577, pos_value:120.00, parts:1, expected_profit:10.55 USDT
+2026-04-18 12:00:00,breakeven_activated,0.13,SHORT,
+2026-04-19 23:00:00,exit_part1,0.12,SHORT,reason: target, PnL:10.44 USDT, баланс:1044.04
+2026-04-19 23:00:00,exit,0.12,SHORT,reason: all_targets_closed, PnL:10.32 USDT, баланс:1044.04
+2026-04-22 01:00:00,мин1,0.12,LONG,
+2026-04-22 05:00:00,макс1,0.13,LONG,
+2026-04-22 13:00:00,мин2,0.13,LONG,
+2026-04-22 16:00:00,entry,0.13,LONG,stop_loss:0.12, qty:944.305640, pos_value:120.00, parts:1, expected_profit:10.68 USDT
+2026-04-22 17:00:00,breakeven_activated,0.13,LONG,
+2026-04-23 00:00:00,exit,0.13,LONG,reason: breakeven_stop, PnL:0.70 USDT, баланс:1044.75
+2026-04-26 01:00:00,мин1,0.13,LONG,
+2026-04-26 12:00:00,макс1,0.13,LONG,
+2026-04-26 13:00:00,мин2,0.13,LONG,
+2026-04-26 19:00:00,entry,0.13,LONG,stop_loss:0.13, qty:1185.770751, pos_value:154.45, parts:1, expected_profit:12.49 USDT
+2026-04-27 01:00:00,breakeven_activated,0.13,LONG,
+2026-04-27 01:00:00,exit,0.13,LONG,reason: breakeven_stop, PnL:0.88 USDT, баланс:1045.62
+2026-04-27 16:00:00,мин1,0.12,LONG,
+2026-04-27 23:00:00,макс1,0.13,LONG,
+2026-04-28 02:00:00,мин2,0.12,LONG,
+2026-04-28 05:00:00,entry,0.13,LONG,stop_loss:0.12, qty:1690.140845, pos_value:211.51, parts:1, expected_profit:16.52 USDT
+2026-04-28 14:00:00,exit,0.12,LONG,reason: stop_loss, PnL:-3.42 USDT, баланс:1042.20
+2026-04-29 12:00:00,макс1,0.13,SHORT,
+2026-04-29 18:00:00,мин1,0.12,SHORT,
+2026-04-30 00:00:00,макс2,0.13,SHORT,
+2026-04-30 03:00:00,entry,0.13,SHORT,stop_loss:0.13, qty:933.779472, pos_value:120.00, parts:1, expected_profit:12.13 USDT
+2026-04-30 04:00:00,breakeven_activated,0.13,SHORT,
+2026-04-30 10:00:00,exit,0.13,SHORT,reason: breakeven_stop, PnL:0.69 USDT, баланс:1042.90
+2026-04-30 16:00:00,макс1,0.13,SHORT,
+2026-05-01 01:00:00,мин1,0.12,SHORT,
+2026-05-01 03:00:00,макс2,0.13,SHORT,
+2026-05-01 07:00:00,entry,0.13,SHORT,stop_loss:0.13, qty:1421.800948, pos_value:180.00, parts:1, expected_profit:14.37 USDT
+2026-05-01 12:00:00,breakeven_activated,0.13,SHORT,
+2026-05-01 12:00:00,exit,0.13,SHORT,reason: breakeven_stop, PnL:1.06 USDT, баланс:1043.96
+2026-05-04 04:00:00,макс1,0.12,SHORT,
+2026-05-04 10:00:00,мин1,0.11,SHORT,
+2026-05-04 14:00:00,макс2,0.12,SHORT,
+2026-05-04 17:00:00,entry,0.12,SHORT,stop_loss:0.12, qty:1028.771304, pos_value:120.00, parts:1, expected_profit:11.74 USDT
+2026-05-04 23:00:00,breakeven_activated,0.12,SHORT,
+2026-05-04 23:00:00,exit,0.12,SHORT,reason: breakeven_stop, PnL:0.79 USDT, баланс:1044.75
+2026-05-05 07:00:00,мин1,0.12,LONG,
+2026-05-06 12:00:00,макс1,0.13,LONG,
+2026-05-06 13:00:00,мин2,0.12,LONG,
+2026-05-06 17:00:00,entry,0.12,LONG,stop_loss:0.12, qty:973.952190, pos_value:120.00, parts:1, expected_profit:11.80 USDT
+2026-05-06 21:00:00,breakeven_activated,0.12,LONG,
+2026-05-07 01:00:00,exit,0.12,LONG,reason: breakeven_stop, PnL:0.73 USDT, баланс:1045.48
+2026-05-07 02:00:00,мин1,0.12,LONG,
+2026-05-07 13:00:00,макс1,0.13,LONG,
+2026-05-07 14:00:00,мин2,0.12,LONG,
+2026-05-07 17:00:00,entry,0.13,LONG,stop_loss:0.12, qty:958.409041, pos_value:120.00, parts:1, expected_profit:11.39 USDT
+2026-05-07 22:00:00,breakeven_activated,0.13,LONG,
+2026-05-07 22:00:00,exit,0.13,LONG,reason: breakeven_stop, PnL:0.72 USDT, баланс:1046.20
+2026-05-08 22:00:00,макс1,0.15,SHORT,
+2026-05-08 23:00:00,мин1,0.14,SHORT,
+2026-05-09 06:00:00,макс2,0.15,SHORT,
+2026-05-09 09:00:00,entry,0.15,SHORT,stop_loss:0.15, qty:1018.675722, pos_value:149.11, parts:1, expected_profit:11.15 USDT
+2026-05-09 10:00:00,breakeven_activated,0.15,SHORT,
+2026-05-10 18:00:00,exit,0.15,SHORT,reason: breakeven_stop, PnL:0.72 USDT, баланс:1046.92
+2026-05-14 22:00:00,макс1,0.13,SHORT,
+2026-05-15 13:00:00,мин1,0.12,SHORT,
+2026-05-15 19:00:00,макс2,0.13,SHORT,
+2026-05-16 00:00:00,entry,0.12,SHORT,stop_loss:0.13, qty:963.140756, pos_value:120.00, parts:1, expected_profit:12.56 USDT
+2026-05-16 05:00:00,breakeven_activated,0.12,SHORT,
+2026-05-16 05:00:00,exit,0.12,SHORT,reason: breakeven_stop, PnL:0.72 USDT, баланс:1047.65
+2026-05-16 06:00:00,макс1,0.12,SHORT,
+2026-05-16 09:00:00,мин1,0.12,SHORT,
+2026-05-16 16:00:00,макс2,0.12,SHORT,
+2026-05-16 19:00:00,entry,0.12,SHORT,stop_loss:0.12, qty:1237.113402, pos_value:149.36, parts:1, expected_profit:12.90 USDT
+2026-05-17 00:00:00,breakeven_activated,0.12,SHORT,
+2026-05-17 04:00:00,exit,0.12,SHORT,reason: breakeven_stop, PnL:0.94 USDT, баланс:1048.59
+2026-05-17 12:00:00,макс1,0.12,SHORT,
+2026-05-18 11:00:00,мин1,0.11,SHORT,
+2026-05-18 12:00:00,макс2,0.12,SHORT,
+2026-05-18 15:00:00,entry,0.12,SHORT,stop_loss:0.12, qty:1026.276966, pos_value:120.00, parts:1, expected_profit:12.28 USDT
+2026-05-19 09:00:00,breakeven_activated,0.12,SHORT,
+2026-05-19 09:00:00,exit,0.12,SHORT,reason: breakeven_stop, PnL:0.79 USDT, баланс:1049.37
+2026-05-21 12:00:00,мин1,0.11,LONG,
+2026-05-21 17:00:00,макс1,0.12,LONG,
+2026-05-22 00:00:00,мин2,0.11,LONG,
+2026-05-22 03:00:00,entry,0.11,LONG,stop_loss:0.11, qty:1069.351928, pos_value:120.00, parts:1, expected_profit:12.33 USDT
+2026-05-22 08:00:00,breakeven_activated,0.11,LONG,
+2026-05-22 08:00:00,exit,0.11,LONG,reason: breakeven_stop, PnL:0.83 USDT, баланс:1050.20
+2026-05-22 13:00:00,макс1,0.12,SHORT,
+2026-05-22 19:00:00,мин1,0.11,SHORT,
+2026-05-22 23:00:00,макс2,0.11,SHORT,
+2026-05-23 05:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1120.845865, pos_value:120.00, parts:1, expected_profit:13.39 USDT
+2026-05-23 07:00:00,breakeven_activated,0.11,SHORT,
+2026-05-23 07:00:00,exit,0.11,SHORT,reason: breakeven_stop, PnL:0.88 USDT, баланс:1051.08
+2026-05-23 08:00:00,мин1,0.10,LONG,
+2026-05-23 21:00:00,макс1,0.11,LONG,
+2026-05-23 22:00:00,мин2,0.11,LONG,
+2026-05-24 04:00:00,entry,0.11,LONG,stop_loss:0.11, qty:1081.930473, pos_value:120.00, parts:1, expected_profit:13.47 USDT
+2026-05-24 05:00:00,exit,0.11,LONG,reason: stop_loss, PnL:-3.24 USDT, баланс:1047.85
+2026-05-24 07:00:00,макс1,0.11,SHORT,
+2026-05-24 15:00:00,мин1,0.11,SHORT,
+2026-05-24 19:00:00,макс2,0.11,SHORT,
+2026-05-24 22:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1485.148515, pos_value:157.01, parts:1, expected_profit:14.88 USDT
+2026-05-25 07:00:00,exit,0.11,SHORT,reason: stop_loss, PnL:-3.32 USDT, баланс:1044.53
+2026-05-26 13:00:00,макс1,0.11,SHORT,
+2026-05-26 17:00:00,мин1,0.11,SHORT,
+2026-05-27 01:00:00,макс2,0.11,SHORT,
+2026-05-27 04:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1093.817651, pos_value:120.00, parts:1, expected_profit:11.95 USDT
+2026-05-27 09:00:00,breakeven_activated,0.11,SHORT,
+2026-05-27 09:00:00,exit,0.11,SHORT,reason: breakeven_stop, PnL:0.85 USDT, баланс:1045.39
+2026-05-27 12:00:00,макс1,0.11,SHORT,
+2026-05-28 16:00:00,мин1,0.10,SHORT,
+2026-05-28 18:00:00,макс2,0.11,SHORT,
+2026-05-28 21:00:00,entry,0.11,SHORT,stop_loss:0.11, qty:1136.632726, pos_value:120.00, parts:1, expected_profit:14.57 USDT
+2026-05-29 02:00:00,breakeven_activated,0.10,SHORT,
+2026-05-29 02:00:00,exit,0.10,SHORT,reason: breakeven_stop, PnL:0.90 USDT, баланс:1046.28
+2026-05-30 00:00:00,мин1,0.10,LONG,
+2026-05-30 03:00:00,макс1,0.11,LONG,
+2026-05-30 08:00:00,мин2,0.10,LONG,
+2026-05-30 13:00:00,entry,0.11,LONG,stop_loss:0.10, qty:1488.833747, pos_value:156.52, parts:1, expected_profit:14.91 USDT
+2026-05-30 23:00:00,exit,0.10,LONG,reason: stop_loss, PnL:-3.31 USDT, баланс:1042.97
+2026-06-01 20:00:00,макс1,0.10,SHORT,
+2026-06-02 14:00:00,мин1,0.09,SHORT,
+2026-06-02 17:00:00,макс2,0.10,SHORT,
+2026-06-02 21:00:00,entry,0.10,SHORT,stop_loss:0.10, qty:1256.651025, pos_value:120.00, parts:1, expected_profit:16.52 USDT
+2026-06-02 22:00:00,breakeven_activated,0.09,SHORT,
+2026-06-03 06:00:00,exit,0.09,SHORT,reason: breakeven_stop, PnL:1.02 USDT, баланс:1043.99
+2026-06-03 15:00:00,макс1,0.10,SHORT,
+2026-06-04 10:00:00,мин1,0.09,SHORT,
+2026-06-04 15:00:00,макс2,0.09,SHORT,
+2026-06-04 18:00:00,entry,0.09,SHORT,stop_loss:0.09, qty:1312.946197, pos_value:120.00, parts:1, expected_profit:17.13 USDT
+2026-06-04 21:00:00,breakeven_activated,0.09,SHORT,
+2026-06-05 18:00:00,exit_part1,0.08,SHORT,reason: target, PnL:17.03 USDT, баланс:1060.90
+2026-06-05 18:00:00,exit,0.08,SHORT,reason: all_targets_closed, PnL:16.91 USDT, баланс:1060.90
+2026-06-06 23:00:00,мин1,0.08,LONG,
+2026-06-07 09:00:00,макс1,0.08,LONG,
+2026-06-07 12:00:00,мин2,0.08,LONG,
+2026-06-07 15:00:00,entry,0.08,LONG,stop_loss:0.08, qty:1482.917926, pos_value:120.00, parts:1, expected_profit:15.40 USDT
+2026-06-07 22:00:00,breakeven_activated,0.08,LONG,
+2026-06-07 22:00:00,exit,0.08,LONG,reason: breakeven_stop, PnL:1.24 USDT, баланс:1062.14
+2026-06-08 22:00:00,макс1,0.08,SHORT,
+2026-06-09 01:00:00,мин1,0.08,SHORT,
+2026-06-09 05:00:00,макс2,0.08,SHORT,
+2026-06-09 09:00:00,entry,0.08,SHORT,stop_loss:0.08, qty:1910.828025, pos_value:156.55, parts:1, expected_profit:18.29 USDT
+2026-06-09 14:00:00,breakeven_activated,0.08,SHORT,
+2026-06-09 14:00:00,exit,0.08,SHORT,reason: breakeven_stop, PnL:1.60 USDT, баланс:1063.74
