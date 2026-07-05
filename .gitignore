@@ -26,3 +26,32 @@ data/historical/
 # Настройки IDE
 .vscode/
 .idea/
+
+# Бэктесты и результаты
+backtest/
+backtest_*.csv
+*_results.csv
+analysis_results.csv
+summary_results.txt
+run_backtest.py
+run_full_cycle.py
+run_optimizer.py
+analyze_losses.py
+
+# Тестовые скрипты и логи
+test_*.py
+test_*.txt
+*.log
+
+# Исторические данные
+data/historical/
+
+# Временные файлы и папки
+temp_check/
+*.zip
+*.tar.gz
+
+# Файлы проектов Visual Studio
+*.pyproj
+*.slnx
+.vs/
