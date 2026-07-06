@@ -1,0 +1,17 @@
+[Unit]
+Description=Grid Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/home/trader/grid_bot
+ExecStart=/home/trader/grid_bot/venv/bin/python /home/trader/grid_bot/main.py
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=gridbot
+
+[Install]
+WantedBy=multi-user.target
