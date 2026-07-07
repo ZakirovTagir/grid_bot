@@ -187,6 +187,8 @@ async def main():
             logger.info("Проверка пар...")
 
             for sym in SYMBOLS:
+                long_finder = finders[sym]['long']
+                short_finder = finders[sym]['short']
                 candle = await get_current_candle(http_session, sym)
                 if candle is None:
                     continue
