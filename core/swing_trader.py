@@ -1,12 +1,15 @@
 """
 core/swing_trader.py
 Классы LongFinder и ShortFinder для поиска свинг-точек в реальном времени.
-Взяты из find_swing_points.py.
+Параметры стратегии передаются через конструктор (или методы) из конфигурации пары.
 """
 import pandas as pd
-import numpy as np
+import logging
 from typing import Optional, Dict, Tuple
-# Вспомогательные функции (копируются из бэктестера)
+
+logger = logging.getLogger(__name__)
+
+# Вспомогательные функции (без изменений)
 def is_noisy(row, min_body_ratio=0.3):
     high, low, open_, close = row['high'], row['low'], row['open'], row['close']
     candle_range = high - low
@@ -15,10 +18,10 @@ def is_noisy(row, min_body_ratio=0.3):
     body = abs(close - open_)
     return (body / candle_range) < min_body_ratio
 
-def get_block_non_noisy(block):
+def get_block_non_noisy(block, min_body_ratio=0.3):
     non_noisy = []
     for idx, row in block.iterrows():
-        if not is_noisy(row):
+        if not is_noisy(row, min_body_ratio):
             non_noisy.append((idx, row))
     return non_noisy
 
@@ -30,8 +33,9 @@ def get_block_extremes(non_noisy):
     return (min_row[1]['low'], min_row[0]), (max_row[1]['high'], max_row[0])
 
 class LongFinder:
-    def __init__(self, symbol):
+    def __init__(self, symbol, params: Optional[Dict] = None):
         self.symbol = symbol
+        self.params = params or {}
         self.state = "WAIT_MIN1"
         self.min1_price = self.min1_idx = None
         self.max1_price = self.max1_idx = None
@@ -39,6 +43,7 @@ class LongFinder:
         self.pending_trend = None
 
     def reset(self):
+        logger.debug(f"[{self.symbol}] LONG сброс состояния из {self.state}")
         self.state = "WAIT_MIN1"
         self.min1_price = self.min1_idx = None
         self.max1_price = self.max1_idx = None
@@ -47,31 +52,42 @@ class LongFinder:
 
     def process_block(self, block_start, block):
         if self.state == "WAIT_ENTRY":
+            logger.debug(f"[{self.symbol}] LONG WAIT_ENTRY, блок {block_start} пропущен")
             return
-        non_noisy = get_block_non_noisy(block)
+
+        min_body_ratio = self.params.get('MIN_BODY_RATIO', 0.3)
+        non_noisy = get_block_non_noisy(block, min_body_ratio)
         if not non_noisy:
-            # print(f"[LONG] Блок {block_start}: все свечи шумные, пропуск.")
+            logger.debug(f"[{self.symbol}] LONG блок {block_start}: все свечи шумные, пропуск")
             return
 
         (L_price, L_idx), (H_price, H_idx) = get_block_extremes(non_noisy)
+        delta_price = self.params.get('DELTA_PRICE', 300)
+        min_distance = self.params.get('MIN_DISTANCE_BARS', 5)
+        max_delta = self.params.get('MAX_DELTA_EXTREMES', 2500)
+
+        logger.debug(f"[{self.symbol}] LONG блок {block_start}-{block_start+6}: L={L_price:.2f} (idx {L_idx}), H={H_price:.2f} (idx {H_idx}), состояние={self.state}")
 
         if self.state == "WAIT_MIN1":
-            if H_idx > L_idx and (H_price - L_price) >= 300:  # DELTA_PRICE – будем использовать переданное значение
+            if H_idx > L_idx and (H_price - L_price) >= delta_price:
                 self.min1_price, self.min1_idx = L_price, L_idx
                 self.max1_price, self.max1_idx = H_price, H_idx
                 self.state = "WAIT_MIN2"
-                # print(f"[LONG] Найдены мин1 и макс1")
+                logger.info(f"[{self.symbol}] LONG найдены мин1={self.min1_price:.2f} (idx {self.min1_idx}), макс1={self.max1_price:.2f} (idx {self.max1_idx})")
             else:
-                # print(f"[LONG] Условия не выполнены, сброс.")
+                logger.debug(f"[{self.symbol}] LONG блок {block_start}: условия WAIT_MIN1 не выполнены")
                 self.reset()
         elif self.state == "WAIT_MIN2":
             if H_price > self.max1_price:
                 self.max1_price, self.max1_idx = H_price, H_idx
-                # print(f"[LONG] Обновлён макс1")
+                logger.debug(f"[{self.symbol}] LONG обновлён макс1 до {self.max1_price:.2f} (idx {self.max1_idx})")
             if L_price > self.min1_price:
                 distance = L_idx - self.min1_idx
-                if distance >= 5 and L_idx > self.max1_idx:  # MIN_DISTANCE_BARS = 5
-                    # MAX_DELTA_EXTREMES проверка будет снаружи
+                if distance >= min_distance and L_idx > self.max1_idx:
+                    if max_delta > 0 and (L_price - self.min1_price) > max_delta:
+                        logger.debug(f"[{self.symbol}] LONG разница мин2-мин1 > {max_delta}, сброс")
+                        self.reset()
+                        return
                     self.min2_price, self.min2_idx = L_price, L_idx
                     self.state = "WAIT_ENTRY"
                     self.pending_trend = {
@@ -80,28 +96,34 @@ class LongFinder:
                         'max1': (self.max1_idx, self.max1_price),
                         'min2': (self.min2_idx, self.min2_price)
                     }
-                    # print(f"[LONG] Найден мин2 – ожидание входа")
+                    logger.info(f"[{self.symbol}] LONG найден мин2={self.min2_price:.2f} (idx {self.min2_idx}) – переход в WAIT_ENTRY")
                 else:
-                    pass  # ждём дальше
+                    logger.debug(f"[{self.symbol}] LONG кандидат в мин2 не подходит (дистанция {distance}, мин. {min_distance})")
             elif L_price < self.min1_price:
-                # print(f"[LONG] Перелом вниз, сброс.")
+                logger.debug(f"[{self.symbol}] LONG перелом вниз, сброс")
                 self.reset()
             else:
-                # print(f"[LONG] L == мин1, сброс.")
                 self.reset()
 
     def check_entry(self, current_idx, current_candle):
         if self.state != "WAIT_ENTRY":
             return None
+
+        min_bars_after = self.params.get('MIN_BARS_AFTER_POINT2', 3)
+        max_bars_after = self.params.get('MAX_BARS_AFTER_POINT2', 7)
+        entry_tolerance = self.params.get('ENTRY_TOLERANCE_USD', 50)
+
+        logger.debug(f"[{self.symbol}] LONG проверка входа: idx={current_idx}")
         if current_candle['low'] < self.min2_price:
-            # print(f"[LONG] Структура нарушена")
+            logger.debug(f"[{self.symbol}] LONG структура нарушена (low < min2)")
             self.reset()
             return None
         bars_since = current_idx - self.min2_idx
-        if bars_since < 3:  # MIN_BARS_AFTER_POINT2
+        if bars_since < min_bars_after:
+            logger.debug(f"[{self.symbol}] LONG слишком рано для входа (прошло {bars_since} баров, нужно {min_bars_after})")
             return None
-        if bars_since > 7:  # MAX_BARS_AFTER_POINT2
-            # print(f"[LONG] Таймаут входа")
+        if bars_since > max_bars_after:
+            logger.debug(f"[{self.symbol}] LONG таймаут входа (прошло {bars_since} баров, максимум {max_bars_after})")
             self.reset()
             return None
 
@@ -109,7 +131,8 @@ class LongFinder:
         support = self.min1_price + (self.min2_price - self.min1_price) * (current_idx - t1) / (t2 - t1)
         low, high = current_candle['low'], current_candle['high']
 
-        if low <= support + 50 and high >= support - 50:  # ENTRY_TOLERANCE_USD = 50 (можно параметризовать)
+        if low <= support + entry_tolerance and high >= support - entry_tolerance:
+            logger.info(f"[{self.symbol}] LONG сигнал входа: цена входа {support:.2f}, tolerance {entry_tolerance}")
             return {
                 'type': 'LONG',
                 'entry_price': support,
@@ -118,11 +141,13 @@ class LongFinder:
                 'max1': (self.max1_idx, self.max1_price),
                 'min2': (self.min2_idx, self.min2_price)
             }
+        logger.debug(f"[{self.symbol}] LONG вход не сработал: low={low:.2f}, high={high:.2f}, support={support:.2f}")
         return None
 
 class ShortFinder:
-    def __init__(self, symbol):
+    def __init__(self, symbol, params: Optional[Dict] = None):
         self.symbol = symbol
+        self.params = params or {}
         self.state = "WAIT_MAX1"
         self.max1_price = self.max1_idx = None
         self.min1_price = self.min1_idx = None
@@ -130,6 +155,7 @@ class ShortFinder:
         self.pending_trend = None
 
     def reset(self):
+        logger.debug(f"[{self.symbol}] SHORT сброс состояния из {self.state}")
         self.state = "WAIT_MAX1"
         self.max1_price = self.max1_idx = None
         self.min1_price = self.min1_idx = None
@@ -138,29 +164,42 @@ class ShortFinder:
 
     def process_block(self, block_start, block):
         if self.state == "WAIT_ENTRY":
+            logger.debug(f"[{self.symbol}] SHORT WAIT_ENTRY, блок {block_start} пропущен")
             return
-        non_noisy = get_block_non_noisy(block)
+
+        min_body_ratio = self.params.get('MIN_BODY_RATIO', 0.3)
+        non_noisy = get_block_non_noisy(block, min_body_ratio)
         if not non_noisy:
+            logger.debug(f"[{self.symbol}] SHORT блок {block_start}: все свечи шумные, пропуск")
             return
 
         (L_price, L_idx), (H_price, H_idx) = get_block_extremes(non_noisy)
+        delta_price = self.params.get('DELTA_PRICE', 300)
+        min_distance = self.params.get('MIN_DISTANCE_BARS', 5)
+        max_delta = self.params.get('MAX_DELTA_EXTREMES', 2500)
+
+        logger.debug(f"[{self.symbol}] SHORT блок {block_start}-{block_start+6}: L={L_price:.2f} (idx {L_idx}), H={H_price:.2f} (idx {H_idx}), состояние={self.state}")
 
         if self.state == "WAIT_MAX1":
-            if L_idx > H_idx and (H_price - L_price) >= 300:
+            if L_idx > H_idx and (H_price - L_price) >= delta_price:
                 self.max1_price, self.max1_idx = H_price, H_idx
                 self.min1_price, self.min1_idx = L_price, L_idx
                 self.state = "WAIT_MAX2"
-                # print(f"[SHORT] Найдены макс1 и мин1")
+                logger.info(f"[{self.symbol}] SHORT найдены макс1={self.max1_price:.2f} (idx {self.max1_idx}), мин1={self.min1_price:.2f} (idx {self.min1_idx})")
             else:
+                logger.debug(f"[{self.symbol}] SHORT блок {block_start}: условия WAIT_MAX1 не выполнены")
                 self.reset()
         elif self.state == "WAIT_MAX2":
             if L_price < self.min1_price:
                 self.min1_price, self.min1_idx = L_price, L_idx
-                # print(f"[SHORT] Обновлён мин1")
+                logger.debug(f"[{self.symbol}] SHORT обновлён мин1 до {self.min1_price:.2f} (idx {self.min1_idx})")
             if H_price < self.max1_price:
                 distance = H_idx - self.max1_idx
-                if distance >= 5 and H_idx > self.min1_idx:
-                    # MAX_DELTA_EXTREMES проверка снаружи
+                if distance >= min_distance and H_idx > self.min1_idx:
+                    if max_delta > 0 and (self.max1_price - H_price) > max_delta:
+                        logger.debug(f"[{self.symbol}] SHORT разница макс1-макс2 > {max_delta}, сброс")
+                        self.reset()
+                        return
                     self.max2_price, self.max2_idx = H_price, H_idx
                     self.state = "WAIT_ENTRY"
                     self.pending_trend = {
@@ -169,28 +208,34 @@ class ShortFinder:
                         'min1': (self.min1_idx, self.min1_price),
                         'max2': (self.max2_idx, self.max2_price)
                     }
-                    # print(f"[SHORT] Найден макс2 – ожидание входа")
+                    logger.info(f"[{self.symbol}] SHORT найден макс2={self.max2_price:.2f} (idx {self.max2_idx}) – переход в WAIT_ENTRY")
                 else:
-                    pass
+                    logger.debug(f"[{self.symbol}] SHORT кандидат в макс2 не подходит (дистанция {distance}, мин. {min_distance})")
             elif H_price > self.max1_price:
-                # print(f"[SHORT] Перелом вверх, сброс.")
+                logger.debug(f"[{self.symbol}] SHORT перелом вверх, сброс")
                 self.reset()
             else:
-                # print(f"[SHORT] H == макс1, сброс.")
                 self.reset()
 
     def check_entry(self, current_idx, current_candle):
         if self.state != "WAIT_ENTRY":
             return None
+
+        min_bars_after = self.params.get('MIN_BARS_AFTER_POINT2', 3)
+        max_bars_after = self.params.get('MAX_BARS_AFTER_POINT2', 7)
+        entry_tolerance = self.params.get('ENTRY_TOLERANCE_USD', 50)
+
+        logger.debug(f"[{self.symbol}] SHORT проверка входа: idx={current_idx}")
         if current_candle['high'] > self.max2_price:
-            # print(f"[SHORT] Структура нарушена")
+            logger.debug(f"[{self.symbol}] SHORT структура нарушена (high > max2)")
             self.reset()
             return None
         bars_since = current_idx - self.max2_idx
-        if bars_since < 3:
+        if bars_since < min_bars_after:
+            logger.debug(f"[{self.symbol}] SHORT слишком рано для входа (прошло {bars_since} баров, нужно {min_bars_after})")
             return None
-        if bars_since > 7:
-            # print(f"[SHORT] Таймаут входа")
+        if bars_since > max_bars_after:
+            logger.debug(f"[{self.symbol}] SHORT таймаут входа (прошло {bars_since} баров, максимум {max_bars_after})")
             self.reset()
             return None
 
@@ -198,7 +243,8 @@ class ShortFinder:
         resistance = self.max1_price + (self.max2_price - self.max1_price) * (current_idx - t1) / (t2 - t1)
         low, high = current_candle['low'], current_candle['high']
 
-        if low <= resistance + 50 and high >= resistance - 50:
+        if low <= resistance + entry_tolerance and high >= resistance - entry_tolerance:
+            logger.info(f"[{self.symbol}] SHORT сигнал входа: цена входа {resistance:.2f}, tolerance {entry_tolerance}")
             return {
                 'type': 'SHORT',
                 'entry_price': resistance,
@@ -207,4 +253,5 @@ class ShortFinder:
                 'min1': (self.min1_idx, self.min1_price),
                 'max2': (self.max2_idx, self.max2_price)
             }
+        logger.debug(f"[{self.symbol}] SHORT вход не сработал: low={low:.2f}, high={high:.2f}, resistance={resistance:.2f}")
         return None

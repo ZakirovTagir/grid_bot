@@ -26,7 +26,7 @@ import os
 import time
 import yaml
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 from dotenv import load_dotenv
 
@@ -42,16 +42,18 @@ load_dotenv()
 # ---------- Глобальные константы ----------
 MAX_TOTAL_RISK_PERCENT = 20.0
 CHECK_INTERVAL = 30          # секунд между проверками
-HISTORY_LIMIT = 300          # начальное количество свечей (для 5-минутного графика)
+HISTORY_LIMIT = 100          # начальное количество свечей (для минутного графика)
 BLOCK_SIZE = 7               # размер непересекающегося блока (как в бэктесте)
 YAML_PATH = "config/pairs.yaml"
 SYMBOLS = []
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Устанавливаем уровень DEBUG для отладки
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ---------- Вспомогательные функции ----------
-async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "5", limit: int = HISTORY_LIMIT):
+async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "1", limit: int = HISTORY_LIMIT):
     """Получает исторические свечи с Bybit Testnet."""
     try:
         end = int(datetime.now().timestamp() * 1000)
@@ -59,7 +61,7 @@ async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "5", li
             category="spot",
             symbol=symbol,
             interval=interval,
-            start=end - limit * 60 * 60 * 1000,
+            start=end - limit * 60 * 60 * 1000,  # интервал в часах (для минутных свечей корректируем ниже)
             end=end,
             limit=limit
         )
@@ -95,11 +97,11 @@ async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "5", li
         return pd.DataFrame()
 
 async def get_current_candle(http_session: HTTP, symbol: str) -> dict | None:
-    """Получает последнюю завершённую 5-минутную свечу."""
+    """Получает последнюю завершённую минутную свечу."""
     df = await fetch_candles(http_session, symbol, limit=2)
     if df.empty or len(df) < 2:
         return None
-    return df.iloc[-2]
+    return df.iloc[-2]   # предпоследняя свеча (последняя завершённая)
 
 # ---------- Глобальные переменные для управления ботом ----------
 running = True
@@ -137,7 +139,10 @@ async def main():
     # 2. Инициализация непрерывных буферов, индексов последней обработанной свечи, искателей, позиций
     buffers = {sym: deque(maxlen=HISTORY_LIMIT) for sym in SYMBOLS}
     last_processed_idx = {sym: -1 for sym in SYMBOLS}   # индекс последней свечи, включённой в блок
-    finders = {sym: {'long': LongFinder(sym), 'short': ShortFinder(sym)} for sym in SYMBOLS}
+    finders = {sym: {
+        'long': LongFinder(sym, params.get(sym, {})),
+        'short': ShortFinder(sym, params.get(sym, {}))
+    } for sym in SYMBOLS}
     positions = {sym: None for sym in SYMBOLS}
 
     # 3. Загрузка истории (заполняем буферы начальными свечами)
@@ -146,9 +151,21 @@ async def main():
         if not df.empty and len(df) >= BLOCK_SIZE:
             for _, row in df.iterrows():
                 buffers[sym].append(row.to_dict())
-            # последний индекс в буфере (самая свежая свеча)
-            last_processed_idx[sym] = len(df) - 1
-            logger.info(f"{sym}: загружено {len(df)} свечей, буфер заполнен")
+            # Обработка всех непересекающихся блоков из начальной истории
+            total_initial = len(buffers[sym])
+            logger.debug(f"{sym}: загружено {total_initial} свечей, начинаем обработку блоков")
+            for start in range(0, total_initial - BLOCK_SIZE + 1, BLOCK_SIZE):
+                end = start + BLOCK_SIZE - 1
+                block_df = pd.DataFrame(
+                    list(buffers[sym])[start:end+1],
+                    index=range(start, end+1)   # сохраняем глобальные индексы
+                )
+                finders[sym]['long'].process_block(start, block_df)
+                finders[sym]['short'].process_block(start, block_df)
+                last_processed_idx[sym] = end
+            logger.info(f"{sym}: загружено {len(df)} свечей, начальные блоки обработаны до индекса {last_processed_idx[sym]}")
+        else:
+            logger.warning(f"{sym}: недостаточно свечей для формирования блока ({len(df) if not df.empty else 0} < {BLOCK_SIZE})")
 
     # 4. Запуск Telegram-бота с колбэками
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -184,7 +201,7 @@ async def main():
                         tg.params = params
                 last_sync = time.time()
 
-            logger.info("Проверка пар...")
+            logger.debug("Проверка пар...")
 
             for sym in SYMBOLS:
                 long_finder = finders[sym]['long']
@@ -206,18 +223,17 @@ async def main():
                     start_idx = last_processed_idx[sym] + 1
                     end_idx = start_idx + BLOCK_SIZE - 1
                     if end_idx < total_candles:
-                        block_df = pd.DataFrame(list(buffers[sym])[start_idx:end_idx+1])
-                        # Вызываем process_block для обоих искателей
-                        long_finder = finders[sym]['long']
-                        short_finder = finders[sym]['short']
+                        block_df = pd.DataFrame(
+                            list(buffers[sym])[start_idx:end_idx+1],
+                            index=range(start_idx, end_idx+1)   # глобальные индексы
+                        )
                         long_finder.process_block(start_idx, block_df)
                         short_finder.process_block(start_idx, block_df)
-                        # Обновляем индекс последней обработанной свечи
                         last_processed_idx[sym] = end_idx
                         logger.debug(f"{sym}: блок {start_idx}-{end_idx} обработан")
 
                 # Проверка входа (check_entry) на каждом новом баре, если есть достаточно свечей
-                df_sym = pd.DataFrame(list(buffers[sym]))
+                df_sym = pd.DataFrame(list(buffers[sym]), index=range(len(buffers[sym])))   # глобальные индексы
                 if len(df_sym) >= 20:   # минимальная история для индикаторов
                     current_candle = df_sym.iloc[-1]
                     pair_params = params.get(sym, {})
