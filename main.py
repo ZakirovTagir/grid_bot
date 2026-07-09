@@ -163,6 +163,16 @@ async def main():
                 finders[sym]['long'].process_block(start, block_df)
                 finders[sym]['short'].process_block(start, block_df)
                 last_processed_idx[sym] = end
+                if last_processed_idx[sym] < total_initial - 1:
+                 df_remaining = pd.DataFrame(
+                    list(buffers[sym])[last_processed_idx[sym]+1:],
+                    index=range(last_processed_idx[sym]+1, total_initial)
+                )
+                for idx, row in df_remaining.iterrows():
+                    signal_long = finders[sym]['long'].check_entry(idx, row)
+                    signal_short = finders[sym]['short'].check_entry(idx, row)
+                    if signal_long or signal_short:
+                        logger.info(f"{sym}: найден сигнал входа на свече {idx}")
             logger.info(f"{sym}: загружено {len(df)} свечей, начальные блоки обработаны до индекса {last_processed_idx[sym]}")
         else:
             logger.warning(f"{sym}: недостаточно свечей для формирования блока ({len(df) if not df.empty else 0} < {BLOCK_SIZE})")
