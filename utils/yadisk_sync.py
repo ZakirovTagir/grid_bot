@@ -1,6 +1,7 @@
 """
 utils/yadisk_sync.py
 Синхронизация config/pairs.yaml с Яндекс.Диском.
+Добавлен метод для загрузки произвольных файлов (например, логов).
 """
 import os
 import logging
@@ -16,7 +17,7 @@ class YaDiskSync:
         self.client = yadisk.YaDisk(token=token)
 
     def upload(self) -> bool:
-        """Загружает локальный файл на Яндекс.Диск."""
+        """Загружает локальный файл на Яндекс.Диск (по умолчанию pairs.yaml)."""
         try:
             if self.client.exists(self.remote_path):
                 self.client.remove(self.remote_path)
@@ -51,4 +52,34 @@ class YaDiskSync:
             return False
         except Exception as e:
             logger.error(f"Ошибка проверки обновлений: {e}")
+            return False
+
+    # ---------- НОВЫЙ МЕТОД ДЛЯ ЗАГРУЗКИ ПРОИЗВОЛЬНЫХ ФАЙЛОВ ----------
+    def upload_file(self, local_path: str, remote_path: str) -> bool:
+        """
+        Загружает любой локальный файл на Яндекс.Диск по указанному удалённому пути.
+        При необходимости создаёт родительские папки.
+        """
+        try:
+            # Проверяем, существует ли локальный файл
+            if not os.path.exists(local_path):
+                logger.error(f"Локальный файл не найден: {local_path}")
+                return False
+
+            # Проверяем существование родительской папки на диске и создаём при необходимости
+            remote_dir = os.path.dirname(remote_path)
+            if remote_dir and not self.client.exists(remote_dir):
+                self.client.mkdir(remote_dir)
+                logger.debug(f"Создана папка на Яндекс.Диске: {remote_dir}")
+
+            # Если файл уже существует — удаляем (перезаписываем)
+            if self.client.exists(remote_path):
+                self.client.remove(remote_path)
+
+            # Загружаем файл
+            self.client.upload(local_path, remote_path)
+            logger.info(f"Файл загружен на Яндекс.Диск: {remote_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка загрузки файла на Яндекс.Диск: {e}")
             return False

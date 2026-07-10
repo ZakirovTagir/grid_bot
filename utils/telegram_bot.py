@@ -1,10 +1,11 @@
 """
 utils/telegram_bot.py
-Telegram-бот для управления целями, синхронизации с Яндекс.Диском и аварийной остановки.
+Telegram-бот для управления целями, синхронизации с Яндекс.Диском, аварийной остановки и выгрузки логов.
 Принимает команды:
 /set_target <SYMBOL> <PART> <PRICE>
 /stop_bot
 /sync
+/upload_logs
 """
 import os
 import logging
@@ -17,15 +18,17 @@ logger = logging.getLogger(__name__)
 YAML_PATH = "config/pairs.yaml"
 
 class TelegramBot:
-    def __init__(self, token: str, stop_callback=None, sync_callback=None):
+    def __init__(self, token: str, stop_callback=None, sync_callback=None, upload_logs_callback=None):
         self.token = token
         self.chat_id = int(os.getenv("TELEGRAM_CHAT_ID", 0))
         self.stop_callback = stop_callback
         self.sync_callback = sync_callback
+        self.upload_logs_callback = upload_logs_callback
         self.app = Application.builder().token(token).build()
         self.app.add_handler(CommandHandler("set_target", self.set_target))
         self.app.add_handler(CommandHandler("stop_bot", self.stop_bot))
         self.app.add_handler(CommandHandler("sync", self.sync_config))
+        self.app.add_handler(CommandHandler("upload_logs", self.upload_logs))
         self.params = {}
 
     async def start(self):
@@ -42,13 +45,13 @@ class TelegramBot:
 
     def load_params(self):
         try:
-            with open(YAML_PATH, 'r') as f:
+            with open(YAML_PATH, 'r', encoding='utf-8') as f:
                 self.params = yaml.safe_load(f)
         except FileNotFoundError:
             self.params = {}
 
     def save_params(self):
-        with open(YAML_PATH, 'w') as f:
+        with open(YAML_PATH, 'w', encoding='utf-8') as f:
             yaml.dump(self.params, f)
 
     async def set_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,7 +83,6 @@ class TelegramBot:
         await update.message.reply_text("Останавливаю бота и закрываю все позиции...")
         if self.stop_callback:
             self.stop_callback()
-        # Здесь можно добавить отправку сообщения о завершении
 
     async def sync_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Принудительная синхронизация конфига с Яндекс.Диском."""
@@ -90,8 +92,24 @@ class TelegramBot:
         else:
             await update.message.reply_text("Яндекс.Диск не настроен")
 
+    async def upload_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выгрузка логов на Яндекс.Диск."""
+        if self.upload_logs_callback:
+            await update.message.reply_text("Начинаю выгрузку логов на Яндекс.Диск...")
+            try:
+                # Колбэк может быть асинхронным, вызываем через await
+                result = await self.upload_logs_callback()
+                if result:
+                    await update.message.reply_text("✅ Логи успешно выгружены на Яндекс.Диск")
+                else:
+                    await update.message.reply_text("❌ Не удалось выгрузить логи на Яндекс.Диск (см. логи)")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка при выгрузке логов: {e}")
+        else:
+            await update.message.reply_text("Яндекс.Диск не настроен или колбэк не передан")
+
     async def send_notification(self, text: str):
-        """Отправляет сообщение в заданный чат (чат должен быть инициирован)."""
+        """Отправляет сообщение в заданный чат."""
         if self.chat_id:
             try:
                 await self.app.bot.send_message(chat_id=self.chat_id, text=text)
