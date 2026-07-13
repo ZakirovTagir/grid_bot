@@ -1,6 +1,6 @@
 """
 utils/telegram_bot.py
-Telegram-бот для управления целями, синхронизации с Яндекс.Диском, аварийной остановки и выгрузки логов.
+Telegram-бот для управления целями, синхронизации с Яндекс.Диском и аварийной остановки.
 Принимает команды:
 /set_target <SYMBOL> <PART> <PRICE>
 /stop_bot
@@ -83,6 +83,7 @@ class TelegramBot:
         await update.message.reply_text("Останавливаю бота и закрываю все позиции...")
         if self.stop_callback:
             self.stop_callback()
+        # Здесь можно добавить отправку сообщения о завершении
 
     async def sync_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Принудительная синхронизация конфига с Яндекс.Диском."""
@@ -93,20 +94,22 @@ class TelegramBot:
             await update.message.reply_text("Яндекс.Диск не настроен")
 
     async def upload_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Выгрузка логов на Яндекс.Диск."""
-        if self.upload_logs_callback:
-            await update.message.reply_text("Начинаю выгрузку логов на Яндекс.Диск...")
-            try:
-                # Колбэк может быть асинхронным, вызываем через await
-                result = await self.upload_logs_callback()
-                if result:
-                    await update.message.reply_text("✅ Логи успешно выгружены на Яндекс.Диск")
-                else:
-                    await update.message.reply_text("❌ Не удалось выгрузить логи на Яндекс.Диск (см. логи)")
-            except Exception as e:
-                await update.message.reply_text(f"❌ Ошибка при выгрузке логов: {e}")
-        else:
-            await update.message.reply_text("Яндекс.Диск не настроен или колбэк не передан")
+        """Обработчик команды /upload_logs для выгрузки логов на Яндекс.Диск."""
+        if not self.upload_logs_callback:
+            await update.message.reply_text("Функция выгрузки логов не настроена.")
+            return
+
+        await update.message.reply_text("Начинаю выгрузку логов на Яндекс.Диск...")
+        try:
+            # Вызываем колбэк и ждём результат (bool)
+            success = await self.upload_logs_callback()
+            if success:
+                await update.message.reply_text("✅ Логи успешно выгружены на Яндекс.Диск.")
+            else:
+                await update.message.reply_text("❌ Не удалось выгрузить логи на Яндекс.Диск (см. логи).")
+        except Exception as e:
+            logger.error(f"Ошибка при выгрузке логов: {e}")
+            await update.message.reply_text(f"❌ Ошибка при выгрузке: {e}")
 
     async def send_notification(self, text: str):
         """Отправляет сообщение в заданный чат."""
