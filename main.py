@@ -2,7 +2,7 @@
 main.py
 Мультивалютный демо-бот на основе свинг-точек.
 Использует Bybit Testnet REST API, Telegram-уведомления, YAML-конфиг с Яндекс.Диска.
-Непересекающиеся блоки по 7 свечей (как в бэктестере) с проверкой входа на каждой свече между блоками.
+Непересекающиеся блоки по 7 свечей с проверкой входа на каждой свече между блоками.
 """
 from __future__ import annotations
 import sys
@@ -175,7 +175,7 @@ async def main():
 
     # 2. Инициализация буферов и искателей
     buffers = {sym: deque(maxlen=HISTORY_LIMIT) for sym in SYMBOLS}
-    last_processed_idx = {sym: -1 for sym in SYMBOLS}   # индекс последней свечи, включённой в блок
+    last_processed_idx = {sym: -1 for sym in SYMBOLS}
     finders = {sym: {
         'long': LongFinder(sym, params.get(sym, {})),
         'short': ShortFinder(sym, params.get(sym, {}))
@@ -189,18 +189,15 @@ async def main():
             debug_logger.warning(f"{sym}: не удалось загрузить свечи")
             continue
 
-        # Сбрасываем состояние искателей
         finders[sym]['long'].reset()
         finders[sym]['short'].reset()
 
-        # Заполняем буфер
         for _, row in df.iterrows():
             buffers[sym].append(row.to_dict())
 
         total_initial = len(buffers[sym])
         debug_logger.info(f"{sym}: загружено {total_initial} свечей, начинаем обработку непересекающимися блоками")
 
-        # Обрабатываем все непересекающиеся блоки (0-6, 7-13, ...)
         for start in range(0, total_initial - BLOCK_SIZE + 1, BLOCK_SIZE):
             end = start + BLOCK_SIZE - 1
             block_df = pd.DataFrame(
@@ -211,17 +208,7 @@ async def main():
             finders[sym]['short'].process_block(start, block_df)
             last_processed_idx[sym] = end
 
-            # Проверяем вход на всех свечах после этого блока до следующего блока
-            # (включая свечи, которые уже есть в буфере и ещё не были проверены)
-            # Но мы можем проверить только свечи, которые уже загружены.
-            # Для этого пройдём по свечам от end+1 до min(end+BLOCK_SIZE, total_initial)
-            # Однако в бэктестере проверка идёт на каждой последующей свече,
-            # поэтому мы проверим все свечи от end+1 до total_initial-1.
-            # Но чтобы не дублировать, мы это сделаем в отдельном цикле после обработки всех блоков.
-            # (см. ниже)
-
-        # После обработки всех блоков проверяем вход на всех оставшихся свечах (остаток)
-        # Это свечи после последнего обработанного блока
+        # Проверяем вход на всех оставшихся свечах после последнего блока
         for idx in range(last_processed_idx[sym] + 1, total_initial):
             current_candle = pd.Series(buffers[sym][idx])
             signal_long = finders[sym]['long'].check_entry(idx, current_candle)
@@ -266,7 +253,6 @@ async def main():
     # 5. Главный цикл
     while running:
         try:
-            # Синхронизация с Яндекс.Диском
             if yadisk and time.time() - last_sync > 300:
                 if yadisk.sync_if_updated():
                     with open(YAML_PATH, "r", encoding="utf-8") as f:
@@ -276,7 +262,6 @@ async def main():
                     debug_logger.info("Конфиг обновлён из Яндекс.Диска")
                 last_sync = time.time()
 
-            # Выгрузка логов раз в час
             if yadisk and time.time() - last_log_upload > 3600:
                 await upload_logs_to_disk(yadisk)
                 last_log_upload = time.time()
@@ -290,17 +275,25 @@ async def main():
                 if candle is None:
                     continue
 
-                # Добавляем свечу, если она новая
                 last_ts = buffers[sym][-1]['timestamp'] if buffers[sym] else None
                 if last_ts is None or candle['timestamp'] > last_ts:
                     buffers[sym].append(candle.to_dict())
                     debug_logger.debug(f"{sym} новая свеча {candle['timestamp']}")
 
-                    # Проверяем, не накопилось ли новых свечей для блока
+                    # ---- НОВОЕ: Проверяем вход на каждой новой свече (даже если блок не формируется) ----
+                    current_idx = len(buffers[sym]) - 1
+                    current_candle = pd.Series(buffers[sym][current_idx])
+                    signal_long = long_finder.check_entry(current_idx, current_candle)
+                    signal_short = short_finder.check_entry(current_idx, current_candle)
+                    if signal_long or signal_short:
+                        signal = signal_long or signal_short
+                        debug_logger.info(f"{sym}: НАЙДЕН СИГНАЛ ВХОДА на свече {current_idx} (реальное время)!")
+                        # Здесь добавить логику выставления ордера
+                    # ----------------------------------------------------------------
+
+                    # Проверяем, не накопилось ли 7 новых свечей для блока
                     total_candles = len(buffers[sym])
-                    # Сколько свечей накопилось с последнего обработанного блока?
                     if total_candles - 1 - last_processed_idx[sym] >= BLOCK_SIZE:
-                        # Формируем следующий непересекающийся блок
                         start_idx = last_processed_idx[sym] + 1
                         end_idx = start_idx + BLOCK_SIZE - 1
                         if end_idx < total_candles:
@@ -313,16 +306,22 @@ async def main():
                             last_processed_idx[sym] = end_idx
                             debug_logger.debug(f"{sym}: блок {start_idx}-{end_idx} обработан (реальное время)")
 
-                            # Проверяем вход на всех свечах, которые появились после этого блока
-                            # (включая только что добавленную)
+                            # Проверяем вход на всех свечах, накопившихся после блока (включая только что добавленную)
+                            # Но мы уже проверили последнюю свечу выше, так что можно проверить все, но это не обязательно
+                            # Оставим только проверку последней, чтобы не дублировать, но для надёжности можно проверить все оставшиеся.
+                            # Однако мы уже вызывали check_entry для текущей свечи, поэтому повтор не нужен.
+                            # Но если между блоком и текущей свечой были другие свечи (они могли накопиться за один цикл),
+                            # то их нужно проверить. Для этого пройдём по диапазону.
                             for idx in range(last_processed_idx[sym] + 1, total_candles):
-                                current_candle_check = pd.Series(buffers[sym][idx])
-                                signal_long = long_finder.check_entry(idx, current_candle_check)
-                                signal_short = short_finder.check_entry(idx, current_candle_check)
+                                # Пропускаем последнюю, так как уже проверили
+                                if idx == total_candles - 1:
+                                    continue
+                                check_candle = pd.Series(buffers[sym][idx])
+                                signal_long = long_finder.check_entry(idx, check_candle)
+                                signal_short = short_finder.check_entry(idx, check_candle)
                                 if signal_long or signal_short:
                                     signal = signal_long or signal_short
-                                    debug_logger.info(f"{sym}: НАЙДЕН СИГНАЛ ВХОДА на свече {idx} (реальное время)!")
-                                    # Здесь можно добавить логику выставления ордера
+                                    debug_logger.info(f"{sym}: НАЙДЕН СИГНАЛ ВХОДА на свече {idx} (после блока)!")
 
             await asyncio.sleep(CHECK_INTERVAL)
 
