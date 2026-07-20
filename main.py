@@ -283,6 +283,7 @@ async def main():
                     # ---- НОВОЕ: Проверяем вход на каждой новой свече (даже если блок не формируется) ----
                     current_idx = len(buffers[sym]) - 1
                     current_candle = pd.Series(buffers[sym][current_idx])
+                    debug_logger.info(f"!!! Вызов check_entry для {sym}, idx={current_idx}, состояние LONG={long_finder.state}, SHORT={short_finder.state}")
                     signal_long = long_finder.check_entry(current_idx, current_candle)
                     signal_short = short_finder.check_entry(current_idx, current_candle)
                     if signal_long or signal_short:
