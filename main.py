@@ -2,6 +2,14 @@
 main.py
 Мультивалютный демо-бот на основе свинг-точек.
 Использует процедурный поиск (core/swing_finder.py) с детальным логированием.
+
+Изменения (патч от 2026-XX-XX):
+- buffers переведён с deque(maxlen=HISTORY_LIMIT) на обычный список,
+  чтобы индексы свечей были сквозными и не сдвигались при вытеснении.
+- fetch_candles: окно запроса start зависит от interval (для 1m = минуты, не часы).
+- Начальная обработка истории приведена к однопроходной логике бэктестера:
+  process_block на каждой 7-й свече + check_entry на каждой свече.
+- last_processed_idx после истории = total_initial - 1.
 """
 from __future__ import annotations
 import sys
@@ -26,7 +34,6 @@ import time
 import yaml
 import pandas as pd
 from datetime import datetime
-from collections import deque
 from dotenv import load_dotenv
 from logging.handlers import RotatingFileHandler
 
@@ -46,6 +53,18 @@ HISTORY_LIMIT = 100
 BLOCK_SIZE = 7
 YAML_PATH = "config/pairs.yaml"
 SYMBOLS = ['BTCUSDT']  # временно только BTCUSDT
+
+INTERVAL_MS = {
+    "1": 60 * 1000,
+    "3": 3 * 60 * 1000,
+    "5": 5 * 60 * 1000,
+    "15": 15 * 60 * 1000,
+    "30": 30 * 60 * 1000,
+    "60": 60 * 60 * 1000,
+    "120": 120 * 60 * 1000,
+    "240": 240 * 60 * 1000,
+    "D": 24 * 60 * 60 * 1000,
+}
 
 # ---------- Настройка логирования ----------
 LOG_FILE = "config/debug.log"
@@ -73,11 +92,13 @@ debug_logger.setLevel(logging.DEBUG)
 async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "1", limit: int = HISTORY_LIMIT):
     try:
         end = int(datetime.now().timestamp() * 1000)
+        step_ms = INTERVAL_MS.get(interval, 60 * 1000)
+        start = end - limit * step_ms
         resp = http_session.get_kline(
             category="spot",
             symbol=symbol,
             interval=interval,
-            start=end - limit * 60 * 60 * 1000,
+            start=start,
             end=end,
             limit=limit
         )
@@ -134,7 +155,6 @@ async def upload_logs_to_disk(yadisk: YaDiskSync, local_path: str = LOG_FILE, re
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         remote_filename = f"debug_{timestamp}.log"
         remote_path = remote_dir + remote_filename
-        # Проверяем, есть ли уже файл с таким именем, и удаляем (чтобы не дублировать)
         if yadisk.client.exists(remote_path):
             yadisk.client.remove(remote_path)
         success = yadisk.upload_file(local_path, remote_path)
@@ -181,7 +201,8 @@ async def main():
         'short': {'state': 'WAIT_MAX1', 'max1': None, 'min1': None, 'max2': None}
     }
 
-    buffers = {sym: deque(maxlen=HISTORY_LIMIT)}
+    # Сквозной список, а не deque(maxlen=...): индексы не сдвигаются
+    buffers = {sym: []}
     last_processed_idx = {sym: -1}
     positions = {sym: None}
 
@@ -195,28 +216,40 @@ async def main():
         buffers[sym].append(row.to_dict())
 
     total_initial = len(buffers[sym])
-    debug_logger.info(f"{sym}: загружено {total_initial} свечей, обрабатываем непересекающиеся блоки")
+    debug_logger.info(f"{sym}: загружено {total_initial} свечей, обрабатываем однопроходно (как в бэктестере)")
 
-    for start in range(0, total_initial - BLOCK_SIZE + 1, BLOCK_SIZE):
-        end = start + BLOCK_SIZE - 1
-        block_df = pd.DataFrame(
-            list(buffers[sym])[start:end+1],
-            index=range(start, end+1)
-        )
-        debug_logger.info(f"{sym}: обработка блока {start}-{end} (история)")
-        process_block(state, start, block_df, params[sym])
-        last_processed_idx[sym] = end
+    # Однопроходная обработка истории: process_block на каждой 7-й свече,
+    # check_entry — на каждой. Полностью совпадает с find_swing_points.py.
+    block_idx_buffer = []
+    block_start = 0
+    for i in range(total_initial):
+        current_candle = pd.Series(buffers[sym][i])
+        block_idx_buffer.append(i)
 
-    # Проверяем остаток
-    for idx in range(last_processed_idx[sym] + 1, total_initial):
-        current_candle = pd.Series(buffers[sym][idx])
-        debug_logger.info(f"{sym}: свеча {idx} (история) O={current_candle['open']:.2f} H={current_candle['high']:.2f} L={current_candle['low']:.2f} C={current_candle['close']:.2f}")
-        debug_logger.info(f"{sym}: состояние перед check_entry: LONG={state['long']['state']}, SHORT={state['short']['state']}")
-        signal = check_entry(state, idx, current_candle, params[sym])
+        if len(block_idx_buffer) == BLOCK_SIZE:
+            block_df = pd.DataFrame(
+                list(buffers[sym])[block_idx_buffer[0]:block_idx_buffer[-1] + 1],
+                index=block_idx_buffer
+            )
+            debug_logger.info(f"{sym}: обработка блока {block_idx_buffer[0]}-{block_idx_buffer[-1]} (история)")
+            process_block(state, block_start, block_df, params[sym])
+            block_idx_buffer = []
+            block_start = i + 1
+
+        signal = check_entry(state, i, current_candle, params[sym])
         if signal:
-            debug_logger.info(f"{sym}: НАЙДЕН СИГНАЛ ВХОДА на свече {idx} (история)! тип={signal['type']}, цена={signal['entry_price']:.2f}")
+            debug_logger.info(
+                f"{sym}: НАЙДЕН СИГНАЛ ВХОДА (история) idx={i} тип={signal['type']} цена={signal['entry_price']:.2f}"
+            )
+            # В бэктестере после входа finder.reset() — здесь позиции не открываем,
+            # но state выравниваем, чтобы live-цикл продолжил с чистого листа.
+            state['long']['state'] = 'WAIT_MIN1'
+            state['long']['min1'] = state['long']['max1'] = state['long']['min2'] = None
+            state['short']['state'] = 'WAIT_MAX1'
+            state['short']['max1'] = state['short']['min1'] = state['short']['max2'] = None
 
-    debug_logger.info(f"{sym}: начальная обработка завершена, последний блок до индекса {last_processed_idx[sym]}")
+    last_processed_idx[sym] = total_initial - 1
+    debug_logger.info(f"{sym}: начальная обработка завершена, last_processed_idx={last_processed_idx[sym]}")
 
     # 4. Telegram
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -251,7 +284,6 @@ async def main():
     # 5. Главный цикл
     while running:
         try:
-            # Синхронизация конфига каждые 5 минут (без выгрузки логов)
             if yadisk and time.time() - last_sync > 300:
                 if yadisk.sync_if_updated():
                     with open(YAML_PATH, "r", encoding="utf-8") as f:
@@ -261,7 +293,6 @@ async def main():
                     debug_logger.info("Конфиг обновлён из Яндекс.Диска")
                 last_sync = time.time()
 
-            # Выгрузка логов раз в час (3600 секунд)
             if yadisk and time.time() - last_log_upload > 3600:
                 await upload_logs_to_disk(yadisk)
                 last_log_upload = time.time()
@@ -270,46 +301,62 @@ async def main():
 
             candle = await get_current_candle(http_session, sym)
             if candle is None:
+                await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
             last_ts = buffers[sym][-1]['timestamp'] if buffers[sym] else None
             if last_ts is None or candle['timestamp'] > last_ts:
                 buffers[sym].append(candle.to_dict())
-                debug_logger.info(f"{sym} НОВАЯ СВЕЧА: {candle['timestamp']} O={candle['open']:.2f} H={candle['high']:.2f} L={candle['low']:.2f} C={candle['close']:.2f}")
-
                 total_candles = len(buffers[sym])
+                current_idx = total_candles - 1
 
-                # Проверка нового блока
-                if total_candles - 1 - last_processed_idx[sym] >= BLOCK_SIZE:
+                debug_logger.info(
+                    f"{sym} НОВАЯ СВЕЧА idx={current_idx}: {candle['timestamp']} "
+                    f"O={candle['open']:.2f} H={candle['high']:.2f} "
+                    f"L={candle['low']:.2f} C={candle['close']:.2f} "
+                    f"(буфер={total_candles}, last_processed_idx={last_processed_idx[sym]})"
+                )
+
+                # Формирование нового блока: 7 свечей от last_processed_idx + 1
+                while total_candles - 1 - last_processed_idx[sym] >= BLOCK_SIZE:
                     start_idx = last_processed_idx[sym] + 1
                     end_idx = start_idx + BLOCK_SIZE - 1
-                    if end_idx < total_candles:
-                        block_df = pd.DataFrame(
-                            list(buffers[sym])[start_idx:end_idx+1],
-                            index=range(start_idx, end_idx+1)
-                        )
-                        debug_logger.info(f"{sym}: формирование блока {start_idx}-{end_idx} (реальное время)")
-                        process_block(state, start_idx, block_df, params[sym])
-                        last_processed_idx[sym] = end_idx
-                        debug_logger.info(f"{sym}: блок {start_idx}-{end_idx} обработан")
+                    if end_idx >= total_candles:
+                        break
+                    block_df = pd.DataFrame(
+                        list(buffers[sym])[start_idx:end_idx + 1],
+                        index=range(start_idx, end_idx + 1)
+                    )
+                    debug_logger.info(f"{sym}: формирование блока {start_idx}-{end_idx} (реальное время)")
+                    process_block(state, start_idx, block_df, params[sym])
+                    last_processed_idx[sym] = end_idx
+                    debug_logger.info(
+                        f"{sym}: блок {start_idx}-{end_idx} обработан, "
+                        f"LONG={state['long']['state']}, SHORT={state['short']['state']}"
+                    )
 
-                        # Проверка свечей после блока
-                        for idx in range(last_processed_idx[sym] + 1, total_candles):
-                            current_candle_check = pd.Series(buffers[sym][idx])
-                            debug_logger.info(f"{sym}: проверка входа на свече {idx} (после блока) O={current_candle_check['open']:.2f} H={current_candle_check['high']:.2f} L={current_candle_check['low']:.2f} C={current_candle_check['close']:.2f}")
-                            debug_logger.info(f"{sym}: состояние перед check_entry: LONG={state['long']['state']}, SHORT={state['short']['state']}")
-                            signal = check_entry(state, idx, current_candle_check, params[sym])
-                            if signal:
-                                debug_logger.info(f"{sym}: НАЙДЕН СИГНАЛ ВХОДА на свече {idx} (реальное время)!")
-
-                # Проверка входа на только что добавленной свече (между блоками)
-                current_idx = len(buffers[sym]) - 1
+                # check_entry на текущей свече (один раз на бар, как в бэктестере)
                 current_candle = pd.Series(buffers[sym][current_idx])
-                debug_logger.info(f"{sym}: проверка входа на свече {current_idx} (между блоками) O={current_candle['open']:.2f} H={current_candle['high']:.2f} L={current_candle['low']:.2f} C={current_candle['close']:.2f}")
-                debug_logger.info(f"{sym}: состояние перед check_entry: LONG={state['long']['state']}, SHORT={state['short']['state']}")
+                debug_logger.info(
+                    f"{sym}: check_entry на свече {current_idx} "
+                    f"LONG={state['long']['state']}, SHORT={state['short']['state']}"
+                )
                 signal = check_entry(state, current_idx, current_candle, params[sym])
                 if signal:
-                    debug_logger.info(f"{sym}: НАЙДЕН СИГНАЛ ВХОДА на свече {current_idx} (реальное время)!")
+                    debug_logger.info(
+                        f"{sym}: НАЙДЕН СИГНАЛ ВХОДА idx={current_idx} "
+                        f"тип={signal['type']} цена={signal['entry_price']:.2f}"
+                    )
+                    if tg:
+                        await tg.send_notification(
+                            f"СИГНАЛ {signal['type']} {sym} @ {signal['entry_price']:.2f} "
+                            f"(idx={current_idx}, {candle['timestamp']})"
+                        )
+                    # После входа state сбрасывается, как в бэктестере (finder.reset()).
+                    state['long']['state'] = 'WAIT_MIN1'
+                    state['long']['min1'] = state['long']['max1'] = state['long']['min2'] = None
+                    state['short']['state'] = 'WAIT_MAX1'
+                    state['short']['max1'] = state['short']['min1'] = state['short']['max2'] = None
 
             await asyncio.sleep(CHECK_INTERVAL)
 
