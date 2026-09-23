@@ -6,16 +6,24 @@ Telegram-бот для управления целями, синхронизац
 /stop_bot
 /sync
 /upload_logs
+
+Патч от 2026-XX-XX:
+- при старте снимает чужой webhook (иначе getUpdates падает с Conflict);
+- retry при Conflict с повторным deleteWebhook;
+- диагностика webhook в логе.
 """
 import os
 import logging
+import asyncio
 import yaml
 from telegram import Update
+from telegram.error import Conflict, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logger = logging.getLogger(__name__)
 
 YAML_PATH = "config/pairs.yaml"
+
 
 class TelegramBot:
     def __init__(self, token: str, stop_callback=None, sync_callback=None, upload_logs_callback=None):
@@ -31,12 +39,43 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("upload_logs", self.upload_logs))
         self.params = {}
 
-    async def start(self):
-        """Запускает бота в фоне (polling)."""
+    async def _clear_webhook(self):
+        """Снимает чужой webhook перед polling, иначе getUpdates даёт Conflict."""
+        try:
+            info = await self.app.bot.get_webhook_info()
+            if info.url:
+                logger.warning(f"Обнаружен чужой webhook: {info.url} — удаляю перед стартом polling")
+                await self.app.bot.delete_webhook(drop_pending_updates=False)
+                logger.info("Webhook удалён")
+            else:
+                logger.info("Webhook отсутствует, polling можно стартовать")
+        except TelegramError as e:
+            logger.error(f"Не удалось проверить/снять webhook: {e}")
+
+    async def start(self, max_retries: int = 5, retry_delay: int = 10):
+        """
+        Запускает бота в фоне (polling).
+        При Conflict повторяет попытку, предварительно снова снося webhook.
+        """
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling()
-        logger.info("Telegram-бот запущен")
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self._clear_webhook()
+                await self.app.updater.start_polling()
+                logger.info("Telegram-бот запущен (polling)")
+                return
+            except Conflict as e:
+                logger.warning(f"Conflict при старте polling (попытка {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error("Не удалось запустить polling после всех попыток")
+                    raise
+            except TelegramError as e:
+                logger.error(f"Ошибка Telegram при запуске polling: {e}")
+                raise
 
     async def stop(self):
         await self.app.updater.stop()
@@ -83,7 +122,6 @@ class TelegramBot:
         await update.message.reply_text("Останавливаю бота и закрываю все позиции...")
         if self.stop_callback:
             self.stop_callback()
-        # Здесь можно добавить отправку сообщения о завершении
 
     async def sync_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Принудительная синхронизация конфига с Яндекс.Диском."""
@@ -101,7 +139,6 @@ class TelegramBot:
 
         await update.message.reply_text("Начинаю выгрузку логов на Яндекс.Диск...")
         try:
-            # Вызываем колбэк и ждём результат (bool)
             success = await self.upload_logs_callback()
             if success:
                 await update.message.reply_text("✅ Логи успешно выгружены на Яндекс.Диск.")

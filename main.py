@@ -191,7 +191,7 @@ async def main():
         debug_logger.error("BTCUSDT не найден в pairs.yaml")
         return
 
-    http_session = HTTP(testnet=True)
+    http_session = HTTP(testnet=False)
     order_mgr = OrderManager()
     risk_mgr = RiskManager(MAX_TOTAL_RISK_PERCENT)
 
