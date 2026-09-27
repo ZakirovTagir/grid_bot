@@ -1,22 +1,27 @@
 # Служебные файлы Visual Studio
 .vs/
+*.pyproj
+*.slnx
 
 # Файлы окружения (токены, ключи)
 .env
 
-# Кэш и скомпилированные файлы Python
+# Кэш Python
 __pycache__/
 *.pyc
 *.pyo
 
-# Логи
+# Логи и временные артефакты
 *.log
+swing_points_log.txt
+diag_bybit.py
+fetch_1m.py
 
 # Тестовые скрипты (не нужны на VPS)
-find_swing_points.py
 test_*.py
+test_*.txt
 
-# Исторические данные
+# Исторические данные (большие, скачиваются на месте)
 data/historical/
 
 # Архивы
@@ -38,20 +43,5 @@ run_full_cycle.py
 run_optimizer.py
 analyze_losses.py
 
-# Тестовые скрипты и логи
-test_*.py
-test_*.txt
-*.log
-
-# Исторические данные
-data/historical/
-
 # Временные файлы и папки
 temp_check/
-*.zip
-*.tar.gz
-
-# Файлы проектов Visual Studio
-*.pyproj
-*.slnx
-.vs/
