@@ -3,13 +3,14 @@ main.py
 Мультивалютный демо-бот на основе свинг-точек.
 Использует процедурный поиск (core/swing_finder.py) с детальным логированием.
 
-Изменения (патч от 2026-XX-XX):
-- buffers переведён с deque(maxlen=HISTORY_LIMIT) на обычный список,
-  чтобы индексы свечей были сквозными и не сдвигались при вытеснении.
-- fetch_candles: окно запроса start зависит от interval (для 1m = минуты, не часы).
-- Начальная обработка истории приведена к однопроходной логике бэктестера:
-  process_block на каждой 7-й свече + check_entry на каждой свече.
-- last_processed_idx после истории = total_initial - 1.
+Изменения:
+- буфер переведён на list (сквозные индексы);
+- однопроходная обработка истории;
+- свечи с mainnet (testnet-спот стоял);
+- таймфрейм вынесен в константу CANDLE_INTERVAL;
+- добавлен reload_params_callback для /apply_candidate;
+- params мутируется in-place (без переприсваивания), чтобы работали
+  все колбэки и главный цикл на едином словаре.
 """
 from __future__ import annotations
 import sys
@@ -48,11 +49,12 @@ load_dotenv()
 
 # ---------- Глобальные константы ----------
 MAX_TOTAL_RISK_PERCENT = 20.0
-CHECK_INTERVAL = 30
-HISTORY_LIMIT = 100
+CHECK_INTERVAL = 30               # период опроса API, сек
+HISTORY_LIMIT = 100               # стартовая загрузка свечей
 BLOCK_SIZE = 7
+CANDLE_INTERVAL = "15"            # "1" | "5" | "15" | "30" | "60" | "240" | "D"
 YAML_PATH = "config/pairs.yaml"
-SYMBOLS = ['BTCUSDT']  # временно только BTCUSDT
+SYMBOLS = ['BTCUSDT']
 
 INTERVAL_MS = {
     "1": 60 * 1000,
@@ -88,8 +90,18 @@ logger.addHandler(file_handler)
 debug_logger = logging.getLogger("debug")
 debug_logger.setLevel(logging.DEBUG)
 
+# Приглушаем шум сторонних библиотек
+for noisy in ("telegram", "telegram.ext", "telegram.ext.ExtBot",
+              "telegram.ext.Updater", "telegram.ext.Application",
+              "httpx", "httpcore", "pybit", "urllib3", "asyncio"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 # ---------- Вспомогательные функции ----------
-async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "1", limit: int = HISTORY_LIMIT):
+async def fetch_candles(http_session: HTTP,
+                        symbol: str,
+                        interval: str = CANDLE_INTERVAL,
+                        limit: int = HISTORY_LIMIT):
     try:
         end = int(datetime.now().timestamp() * 1000)
         step_ms = INTERVAL_MS.get(interval, 60 * 1000)
@@ -100,7 +112,7 @@ async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "1", li
             interval=interval,
             start=start,
             end=end,
-            limit=limit
+            limit=limit,
         )
         if resp.get("retCode") == 0:
             data = resp["result"]["list"]
@@ -111,21 +123,16 @@ async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "1", li
                 if len(item) < 6:
                     continue
                 ts = int(item[0])
-                open_ = float(item[1])
-                high = float(item[2])
-                low = float(item[3])
-                close = float(item[4])
-                volume = float(item[5])
                 candles.append({
                     "timestamp": pd.Timestamp(ts, unit='ms'),
-                    "open": open_,
-                    "high": high,
-                    "low": low,
-                    "close": close,
-                    "volume": volume
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
                 })
             df = pd.DataFrame(candles).sort_values("timestamp")
-            debug_logger.debug(f"Загружено {len(df)} свечей для {symbol}")
+            debug_logger.debug(f"Загружено {len(df)} свечей {interval}m для {symbol}")
             return df
         else:
             debug_logger.error(f"Ошибка получения свечей {symbol}: {resp}")
@@ -134,47 +141,55 @@ async def fetch_candles(http_session: HTTP, symbol: str, interval: str = "1", li
         debug_logger.error(f"Исключение получения свечей для {symbol}: {e}")
         return pd.DataFrame()
 
-async def get_current_candle(http_session: HTTP, symbol: str) -> dict | None:
+
+async def get_current_candle(http_session: HTTP, symbol: str):
+    """Последняя ЗАКРЫТАЯ свеча (iloc[-2] — потому что iloc[-1] — формирующаяся)."""
     df = await fetch_candles(http_session, symbol, limit=2)
     if df.empty or len(df) < 2:
         return None
     return df.iloc[-2]
 
+
+async def upload_logs_to_disk(yadisk: YaDiskSync,
+                              local_path: str = LOG_FILE,
+                              remote_dir: str = "grid_bot/logs/"):
+    if not yadisk:
+        debug_logger.warning("Яндекс.Диск не инициализирован")
+        return False
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        remote_path = remote_dir + f"debug_{timestamp}.log"
+        if yadisk.client.exists(remote_path):
+            yadisk.client.remove(remote_path)
+        success = yadisk.upload_file(local_path, remote_path)
+        if success:
+            debug_logger.info(f"Лог выгружен: {remote_path}")
+        else:
+            debug_logger.error("Не удалось выгрузить лог")
+        return success
+    except Exception as e:
+        debug_logger.error(f"Ошибка выгрузки лога: {e}")
+        return False
+
+
 # ---------- Управление ботом ----------
 running = True
+
 
 def set_running(value: bool):
     global running
     running = value
 
-async def upload_logs_to_disk(yadisk: YaDiskSync, local_path: str = LOG_FILE, remote_dir: str = "grid_bot/logs/"):
-    if not yadisk:
-        debug_logger.warning("Яндекс.Диск не инициализирован, выгрузка логов невозможна")
-        return False
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        remote_filename = f"debug_{timestamp}.log"
-        remote_path = remote_dir + remote_filename
-        if yadisk.client.exists(remote_path):
-            yadisk.client.remove(remote_path)
-        success = yadisk.upload_file(local_path, remote_path)
-        if success:
-            debug_logger.info(f"Лог успешно выгружен на Яндекс.Диск: {remote_path}")
-        else:
-            debug_logger.error("Не удалось выгрузить лог на Яндекс.Диск")
-        return success
-    except Exception as e:
-        debug_logger.error(f"Ошибка при выгрузке лога: {e}")
-        return False
 
 # ---------- Основная функция ----------
 async def main():
-    # 1. Загрузка параметров из YAML
+    # 1. Яндекс.Диск и конфиг
     yadisk_token = os.getenv("YADISK_TOKEN")
-    yadisk = YaDiskSync(yadisk_token, YAML_PATH, remote_path="grid_bot/config/pairs.yaml") if yadisk_token else None
+    yadisk = YaDiskSync(yadisk_token, YAML_PATH,
+                        remote_path="grid_bot/config/pairs.yaml") if yadisk_token else None
     if yadisk:
         if not yadisk.client.exists(yadisk.remote_path):
-            debug_logger.info("Файл не найден на Яндекс.Диске, загружаю локальный")
+            debug_logger.info("Файла нет на Яндекс.Диске, загружаю локальный")
             yadisk.upload()
         else:
             yadisk.download()
@@ -184,14 +199,26 @@ async def main():
         with open(YAML_PATH, "r", encoding="utf-8") as f:
             params = yaml.safe_load(f)
     except FileNotFoundError:
-        debug_logger.error("config/pairs.yaml не найден. Создайте файл с параметрами.")
+        debug_logger.error("config/pairs.yaml не найден")
         return
 
     if 'BTCUSDT' not in params:
         debug_logger.error("BTCUSDT не найден в pairs.yaml")
         return
 
-    http_session = HTTP(testnet=False)
+    # Функция перечитывания params из файла (для /apply_candidate)
+    def reload_params_from_disk():
+        try:
+            with open(YAML_PATH, "r", encoding="utf-8") as f:
+                new_params = yaml.safe_load(f)
+            params.clear()
+            params.update(new_params)
+            debug_logger.info("Параметры перечитаны из pairs.yaml (apply_candidate)")
+        except Exception as e:
+            debug_logger.error(f"reload_params_from_disk failed: {e}")
+            raise
+
+    http_session = HTTP(testnet=False)   # mainnet для свечей
     order_mgr = OrderManager()
     risk_mgr = RiskManager(MAX_TOTAL_RISK_PERCENT)
 
@@ -201,12 +228,11 @@ async def main():
         'short': {'state': 'WAIT_MAX1', 'max1': None, 'min1': None, 'max2': None}
     }
 
-    # Сквозной список, а не deque(maxlen=...): индексы не сдвигаются
     buffers = {sym: []}
     last_processed_idx = {sym: -1}
     positions = {sym: None}
 
-    # 3. Загрузка истории
+    # 3. Стартовая загрузка истории
     df = await fetch_candles(http_session, sym)
     if df.empty:
         debug_logger.error(f"{sym}: не удалось загрузить свечи")
@@ -216,10 +242,11 @@ async def main():
         buffers[sym].append(row.to_dict())
 
     total_initial = len(buffers[sym])
-    debug_logger.info(f"{sym}: загружено {total_initial} свечей, обрабатываем однопроходно (как в бэктестере)")
+    debug_logger.info(
+        f"{sym}: загружено {total_initial} свечей "
+        f"({CANDLE_INTERVAL}m), однопроходная обработка"
+    )
 
-    # Однопроходная обработка истории: process_block на каждой 7-й свече,
-    # check_entry — на каждой. Полностью совпадает с find_swing_points.py.
     block_idx_buffer = []
     block_start = 0
     for i in range(total_initial):
@@ -229,9 +256,11 @@ async def main():
         if len(block_idx_buffer) == BLOCK_SIZE:
             block_df = pd.DataFrame(
                 list(buffers[sym])[block_idx_buffer[0]:block_idx_buffer[-1] + 1],
-                index=block_idx_buffer
+                index=block_idx_buffer,
             )
-            debug_logger.info(f"{sym}: обработка блока {block_idx_buffer[0]}-{block_idx_buffer[-1]} (история)")
+            debug_logger.info(
+                f"{sym}: блок {block_idx_buffer[0]}-{block_idx_buffer[-1]} (история)"
+            )
             process_block(state, block_start, block_df, params[sym])
             block_idx_buffer = []
             block_start = i + 1
@@ -239,17 +268,16 @@ async def main():
         signal = check_entry(state, i, current_candle, params[sym])
         if signal:
             debug_logger.info(
-                f"{sym}: НАЙДЕН СИГНАЛ ВХОДА (история) idx={i} тип={signal['type']} цена={signal['entry_price']:.2f}"
+                f"{sym}: СИГНАЛ (история) idx={i} "
+                f"тип={signal['type']} цена={signal['entry_price']:.2f}"
             )
-            # В бэктестере после входа finder.reset() — здесь позиции не открываем,
-            # но state выравниваем, чтобы live-цикл продолжил с чистого листа.
             state['long']['state'] = 'WAIT_MIN1'
             state['long']['min1'] = state['long']['max1'] = state['long']['min2'] = None
             state['short']['state'] = 'WAIT_MAX1'
             state['short']['max1'] = state['short']['min1'] = state['short']['max2'] = None
 
     last_processed_idx[sym] = total_initial - 1
-    debug_logger.info(f"{sym}: начальная обработка завершена, last_processed_idx={last_processed_idx[sym]}")
+    debug_logger.info(f"{sym}: стартовая обработка завершена, last_processed_idx={last_processed_idx[sym]}")
 
     # 4. Telegram
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -258,15 +286,14 @@ async def main():
         async def upload_logs_callback():
             if yadisk:
                 return await upload_logs_to_disk(yadisk)
-            else:
-                debug_logger.warning("Яндекс.Диск не настроен, выгрузка невозможна")
-                return False
+            return False
 
         tg = TelegramBot(
             tg_token,
             stop_callback=lambda: set_running(False),
             sync_callback=lambda: yadisk.sync_if_updated() if yadisk else None,
-            upload_logs_callback=upload_logs_callback
+            upload_logs_callback=upload_logs_callback,
+            reload_params_callback=reload_params_from_disk,
         )
         await tg.start()
         debug_logger.info("Telegram-бот запущен")
@@ -274,9 +301,11 @@ async def main():
         debug_logger.warning("TELEGRAM_BOT_TOKEN не задан – уведомления отключены")
 
     if tg:
-        await tg.send_notification("Мультивалютный демо-бот запущен")
+        await tg.send_notification(
+            f"Мультивалютный демо-бот запущен ({CANDLE_INTERVAL}m, BTCUSDT)"
+        )
 
-    debug_logger.info("Мультивалютный демо-бот запущен")
+    debug_logger.info(f"Мультивалютный демо-бот запущен (TF={CANDLE_INTERVAL}m)")
 
     last_sync = time.time()
     last_log_upload = time.time()
@@ -284,20 +313,22 @@ async def main():
     # 5. Главный цикл
     while running:
         try:
+            # Синхронизация конфига раз в 5 мин
             if yadisk and time.time() - last_sync > 300:
                 if yadisk.sync_if_updated():
                     with open(YAML_PATH, "r", encoding="utf-8") as f:
-                        params = yaml.safe_load(f)
+                        new_params = yaml.safe_load(f)
+                    params.clear()
+                    params.update(new_params)
                     if tg:
                         tg.params = params
                     debug_logger.info("Конфиг обновлён из Яндекс.Диска")
                 last_sync = time.time()
 
+            # Выгрузка логов раз в час
             if yadisk and time.time() - last_log_upload > 3600:
                 await upload_logs_to_disk(yadisk)
                 last_log_upload = time.time()
-
-            debug_logger.debug("Проверка пар...")
 
             candle = await get_current_candle(http_session, sym)
             if candle is None:
@@ -317,7 +348,7 @@ async def main():
                     f"(буфер={total_candles}, last_processed_idx={last_processed_idx[sym]})"
                 )
 
-                # Формирование нового блока: 7 свечей от last_processed_idx + 1
+                # Формирование блоков
                 while total_candles - 1 - last_processed_idx[sym] >= BLOCK_SIZE:
                     start_idx = last_processed_idx[sym] + 1
                     end_idx = start_idx + BLOCK_SIZE - 1
@@ -325,9 +356,11 @@ async def main():
                         break
                     block_df = pd.DataFrame(
                         list(buffers[sym])[start_idx:end_idx + 1],
-                        index=range(start_idx, end_idx + 1)
+                        index=range(start_idx, end_idx + 1),
                     )
-                    debug_logger.info(f"{sym}: формирование блока {start_idx}-{end_idx} (реальное время)")
+                    debug_logger.info(
+                        f"{sym}: формирование блока {start_idx}-{end_idx}"
+                    )
                     process_block(state, start_idx, block_df, params[sym])
                     last_processed_idx[sym] = end_idx
                     debug_logger.info(
@@ -335,24 +368,27 @@ async def main():
                         f"LONG={state['long']['state']}, SHORT={state['short']['state']}"
                     )
 
-                # check_entry на текущей свече (один раз на бар, как в бэктестере)
+                # check_entry на текущей свече
                 current_candle = pd.Series(buffers[sym][current_idx])
                 debug_logger.info(
-                    f"{sym}: check_entry на свече {current_idx} "
+                    f"{sym}: check_entry idx={current_idx} "
                     f"LONG={state['long']['state']}, SHORT={state['short']['state']}"
                 )
                 signal = check_entry(state, current_idx, current_candle, params[sym])
                 if signal:
                     debug_logger.info(
-                        f"{sym}: НАЙДЕН СИГНАЛ ВХОДА idx={current_idx} "
+                        f"{sym}: НАЙДЕН СИГНАЛ idx={current_idx} "
                         f"тип={signal['type']} цена={signal['entry_price']:.2f}"
                     )
                     if tg:
-                        await tg.send_notification(
-                            f"СИГНАЛ {signal['type']} {sym} @ {signal['entry_price']:.2f} "
-                            f"(idx={current_idx}, {candle['timestamp']})"
-                        )
-                    # После входа state сбрасывается, как в бэктестере (finder.reset()).
+                        try:
+                            await tg.send_notification(
+                                f"СИГНАЛ {signal['type']} {sym} @ {signal['entry_price']:.2f} "
+                                f"(idx={current_idx}, {candle['timestamp']})"
+                            )
+                        except Exception as e:
+                            debug_logger.warning(f"Telegram notify failed: {e}")
+
                     state['long']['state'] = 'WAIT_MIN1'
                     state['long']['min1'] = state['long']['max1'] = state['long']['min2'] = None
                     state['short']['state'] = 'WAIT_MAX1'
@@ -367,10 +403,11 @@ async def main():
     # 6. Завершение
     debug_logger.info("Бот остановлен")
     if tg:
-        await tg.send_notification("Бот остановлен. Все позиции закрыты.")
+        await tg.send_notification("Бот остановлен.")
         await tg.stop()
     if yadisk:
         await upload_logs_to_disk(yadisk)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

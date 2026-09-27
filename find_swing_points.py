@@ -25,7 +25,7 @@ DEFAULT_PARAMS = {
     'MIN_DISTANCE_BARS': 5,
     'MAX_DELTA_EXTREMES': 500,
     # --- группа B: вход ---
-    'ENTRY_TOLERANCE_USD': 50,
+    'ENTRY_TOLERANCE_USD': 500,
     'MIN_BARS_AFTER_POINT2': 3,
     'MAX_BARS_AFTER_POINT2': 7,
     # --- группа C: управление позицией ---
