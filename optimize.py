@@ -6,6 +6,10 @@ optimize.py — оптимизатор параметров стратегии �
 - перебор полного grid на IS;
 - OOS-проверка топ-30;
 - при успехе — pairs_candidate_{tf}.yaml + уведомление.
+
+Запуск (на сервере):
+    source venv/bin/activate
+    nohup python -u optimize.py --tf 15 --workers 2 > optimization/run_15m.log 2>&1 &
 """
 
 import os
@@ -16,6 +20,7 @@ import argparse
 import itertools
 import signal
 import contextlib
+import traceback
 import multiprocessing as mp
 import urllib.request
 import json
@@ -70,16 +75,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ============================================================
 def tg_send(text: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[tg] skipped (no token/chat_id): {text[:80]}")
+        print(f"[tg] skipped (no token/chat_id): {text[:80]}", flush=True)
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=data,
+                                     headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
     except Exception as e:
-        print(f"[tg] send failed: {e}")
+        print(f"[tg] send failed: {e}", flush=True)
 
 
 # ============================================================
@@ -164,9 +170,9 @@ def ensure_csv(tf: str, days_back: int) -> str:
     if os.path.exists(path):
         age_hours = (time.time() - os.path.getmtime(path)) / 3600
         if age_hours < 24:
-            print(f"CSV актуален ({age_hours:.1f} ч): {path}")
+            print(f"CSV актуален ({age_hours:.1f} ч): {path}", flush=True)
             return path
-    print(f"Скачиваю свечи: TF={tf}, {days_back} дней")
+    print(f"Скачиваю свечи: TF={tf}, {days_back} дней", flush=True)
     fetch_history("BTCUSDT", tf, days_back, path, verbose=True)
     return path
 
@@ -229,8 +235,12 @@ def _worker(combo):
         with contextlib.redirect_stdout(buf):
             metrics = run_backtest(params, _IS_DF, initial_balance=_BALANCE,
                                    save_events_path=None, verbose=False)
-    except Exception:
-        return None
+    except Exception as e:
+        return {
+            "error": f"{type(e).__name__}: {e}",
+            "trace": traceback.format_exc()[:800],
+            "combo": combo,
+        }
     row = dict(combo)
     row.update({
         "score": compute_score(metrics),
@@ -257,7 +267,6 @@ def write_candidate(tf: str, best_params: Dict[str, Any],
         cfg = yaml.safe_load(f) or {}
     if "BTCUSDT" not in cfg:
         cfg["BTCUSDT"] = {}
-    old = dict(cfg["BTCUSDT"])
     for k, v in best_params.items():
         cfg["BTCUSDT"][k] = v
     cfg["BTCUSDT"]["_optimization"] = {
@@ -284,14 +293,14 @@ def run_optimization(tf: str, workers: int = 1, limit: Optional[int] = None,
                      initial_balance: float = 1000.0):
     csv_path = ensure_csv(tf, TOTAL_DAYS)
     is_df, oos_df = load_and_split(csv_path, IS_MONTHS, OOS_MONTHS)
-    print(f"IS : {len(is_df)} свечей ({is_df['timestamp'].min()} .. {is_df['timestamp'].max()})")
-    print(f"OOS: {len(oos_df)} свечей ({oos_df['timestamp'].min()} .. {oos_df['timestamp'].max()})")
+    print(f"IS : {len(is_df)} свечей ({is_df['timestamp'].min()} .. {is_df['timestamp'].max()})", flush=True)
+    print(f"OOS: {len(oos_df)} свечей ({oos_df['timestamp'].min()} .. {oos_df['timestamp'].max()})", flush=True)
 
     combos = list(generate_combinations(GRIDS[tf]))
     if limit is not None:
         combos = combos[:limit]
     total = len(combos)
-    print(f"Всего комбинаций: {total}, workers={workers}")
+    print(f"Всего комбинаций: {total}, workers={workers}", flush=True)
 
     ts = datetime.now().strftime("%Y-%m-%d_%H%M")
     is_csv = os.path.join(RESULTS_DIR, f"{ts}_{tf}m_IS.csv")
@@ -299,28 +308,40 @@ def run_optimization(tf: str, workers: int = 1, limit: Optional[int] = None,
 
     tg_send(f"Оптимизатор запущен: TF={tf}m, комбо={total}, workers={workers}")
 
-    results = []
+    results: List[Dict[str, Any]] = []
+    errors_printed = 0
     t_start = time.time()
     last_report = t_start
 
     def _handle_row(row, i):
-        nonlocal last_report
+        nonlocal last_report, errors_printed
         if row is None:
             return
+        if isinstance(row, dict) and "error" in row:
+            if errors_printed < 3:
+                print(f"[error #{i}] {row['error']}", flush=True)
+                print(row.get("trace", "")[:600], flush=True)
+                print(f"combo: {row['combo']}", flush=True)
+                errors_printed += 1
+            return
         results.append(row)
+
         if (i + 1) % 50 == 0 or (i + 1) == total:
             elapsed = time.time() - t_start
             rate = (i + 1) / elapsed if elapsed > 0 else 0
             eta = (total - i - 1) / rate if rate > 0 else 0
-            print(f"[{i+1}/{total}] elapsed={elapsed:.0f}s ETA={eta:.0f}s "
-                  f"best_so_far={max(r['score'] for r in results):.2f}")
+            best = max((r['score'] for r in results), default=float('-inf'))
+            print(f"[{i+1}/{total}] ok={len(results)} elapsed={elapsed:.0f}s "
+                  f"ETA={eta:.0f}s best={best:.2f}", flush=True)
+
         if time.time() - last_report > PROGRESS_INTERVAL_SEC:
             elapsed = time.time() - t_start
             rate = (i + 1) / elapsed if elapsed > 0 else 0
             eta = (total - i - 1) / rate if rate > 0 else 0
-            best = max(r['score'] for r in results) if results else 0
+            best = max((r['score'] for r in results), default=0)
             tg_send(f"Оптимизатор [{tf}m]: {i+1}/{total} "
-                    f"({(i+1)/total*100:.1f}%), ETA {eta/3600:.1f}ч, best_score={best:.2f}")
+                    f"({(i+1)/total*100:.1f}%), ETA {eta/3600:.1f}ч, "
+                    f"best_score={best:.2f}, ok={len(results)}")
             last_report = time.time()
 
     if workers > 1:
@@ -338,21 +359,24 @@ def run_optimization(tf: str, workers: int = 1, limit: Optional[int] = None,
     if not is_df_result.empty:
         is_df_result.sort_values("score", ascending=False, inplace=True)
     is_df_result.to_csv(is_csv, index=False)
-    print(f"\nIS результатов: {len(is_df_result)} → {is_csv}")
-    print(f"Total time (IS): {time.time() - t_start:.1f}s")
+    print(f"\nIS результатов: {len(is_df_result)} (из {total} комбо, "
+          f"ошибок: {errors_printed if errors_printed < 3 else '3+'} )", flush=True)
+    print(f"IS → {is_csv}", flush=True)
+    print(f"Total time (IS): {time.time() - t_start:.1f}s", flush=True)
 
     if is_df_result.empty:
         tg_send(f"Оптимизатор [{tf}m]: пустой результат, кандидат не создан")
         return
 
-    print("\n=== TOP-5 (IS) ===")
+    print("\n=== TOP-5 (IS) ===", flush=True)
     for _, r in is_df_result.head(5).iterrows():
         print(f"score={r['score']:.2f} net={r['net_pnl']:.2f} "
-              f"trades={r['num_trades']:.0f} wr={r['win_rate']:.3f} dd={r['max_drawdown_pct']:.2f}%")
+              f"trades={r['num_trades']:.0f} wr={r['win_rate']:.3f} "
+              f"dd={r['max_drawdown_pct']:.2f}%", flush=True)
 
     # ---- OOS-проверка топ-N ----
     top = is_df_result.head(TOP_N_FOR_OOS)
-    print(f"\nOOS-проверка топ-{len(top)}...")
+    print(f"\nOOS-проверка топ-{len(top)}...", flush=True)
 
     oos_results = []
     for _, row in top.iterrows():
@@ -380,20 +404,20 @@ def run_optimization(tf: str, workers: int = 1, limit: Optional[int] = None,
 
     oos_df_result = pd.DataFrame(oos_results)
     oos_df_result.to_csv(oos_csv, index=False)
-    print(f"OOS результатов: {len(oos_df_result)} → {oos_csv}")
+    print(f"OOS результатов: {len(oos_df_result)} → {oos_csv}", flush=True)
 
-    passed = oos_df_result[oos_df_result["passed"] == True].sort_values("oos_net_pnl", ascending=False)
+    passed = oos_df_result[oos_df_result["passed"] == True].sort_values(
+        "oos_net_pnl", ascending=False)
 
     if passed.empty:
         tg_send(f"Оптимизатор [{tf}m] завершён. Улучшения не найдено: "
                 f"0 из {len(oos_df_result)} кандидатов прошли OOS-фильтр.")
-        print("\nУлучшения не найдено: ни один кандидат не прошёл OOS.")
+        print("\nУлучшения не найдено: ни один кандидат не прошёл OOS.", flush=True)
         return
 
     winner = passed.iloc[0]
     best_params = {k: winner[k] for k in PARAM_KEYS_ORDER}
 
-    # Пересчёт метрик победителя для записи в кандидат
     params = dict(DEFAULT_PARAMS)
     params.update(best_params)
     buf = io.StringIO()
@@ -402,17 +426,18 @@ def run_optimization(tf: str, workers: int = 1, limit: Optional[int] = None,
         oos_m = run_backtest(params, oos_df, initial_balance=initial_balance, verbose=False)
 
     cand_path = write_candidate(tf, best_params, is_m, oos_m)
-    print(f"\nКандидат записан: {cand_path}")
+    print(f"\nКандидат записан: {cand_path}", flush=True)
 
-    # Текущие значения
     with open(PAIRS_YAML, "r", encoding="utf-8") as f:
         current_cfg = yaml.safe_load(f) or {}
     current_btc = current_cfg.get("BTCUSDT", {})
 
     lines = [f"НОВЫЙ КАНДИДАТ [{tf}m]",
              f"TF: {tf}m",
-             f"IS: net={is_m['net_pnl']:.2f} trades={is_m['num_trades']} wr={is_m['win_rate']:.3f}",
-             f"OOS: net={oos_m['net_pnl']:.2f} trades={oos_m['num_trades']} wr={oos_m['win_rate']:.3f}",
+             f"IS: net={is_m['net_pnl']:.2f} trades={is_m['num_trades']} "
+             f"wr={is_m['win_rate']:.3f}",
+             f"OOS: net={oos_m['net_pnl']:.2f} trades={oos_m['num_trades']} "
+             f"wr={oos_m['win_rate']:.3f}",
              ""]
     for k in PARAM_KEYS_ORDER:
         old_v = current_btc.get(k, "?")
@@ -423,7 +448,7 @@ def run_optimization(tf: str, workers: int = 1, limit: Optional[int] = None,
     lines.append("Применить: /apply_candidate")
 
     tg_send("\n".join(lines))
-    print("\n".join(lines))
+    print("\n".join(lines), flush=True)
 
 
 # ============================================================
@@ -439,12 +464,12 @@ def main():
 
     tf = args.tf if args.tf else read_current_tf()
     if tf not in GRIDS:
-        print(f"ERROR: unsupported TF '{tf}'. Allowed: {list(GRIDS.keys())}")
+        print(f"ERROR: unsupported TF '{tf}'. Allowed: {list(GRIDS.keys())}", flush=True)
         sys.exit(1)
 
     if not acquire_lock():
         msg = f"Оптимизатор [{tf}m]: предыдущий запуск ещё работает, старт отменён."
-        print(msg)
+        print(msg, flush=True)
         tg_send(msg)
         sys.exit(2)
 
@@ -457,7 +482,7 @@ def main():
 
     try:
         print(f"=== Оптимизатор === TF: {tf}m, workers={args.workers}, "
-              f"IS: {IS_MONTHS} мес, OOS: {OOS_MONTHS} мес")
+              f"IS: {IS_MONTHS} мес, OOS: {OOS_MONTHS} мес", flush=True)
         run_optimization(tf, workers=args.workers, limit=args.limit,
                          initial_balance=args.balance)
     finally:
