@@ -10,8 +10,8 @@ Telegram-бот для управления целями, оптимизатор
     /test_1h        — выбрать TF=1h и запустить расчёт параметров
     /test_30m       — TF=30m + запуск
     /test_15m       — TF=15m + запуск
-    /opt_status     — статус калькулятора (TF, lock, последний результат)
-    /apply_candidate — применить pairs_candidate_{tf}m.yaml поверх pairs.yaml
+    /opt_status     — статус калькулятора
+    /apply_candidate — применить pairs_candidate_{tf}m.yaml + загрузить pairs.yaml на Я.Диск
 """
 import os
 import sys
@@ -43,13 +43,15 @@ TF_LABEL = {"60": "1h", "30": "30m", "15": "15m"}
 
 class TelegramBot:
     def __init__(self, token: str, stop_callback=None, sync_callback=None,
-                 upload_logs_callback=None, reload_params_callback=None):
+                 upload_logs_callback=None, reload_params_callback=None,
+                 upload_params_callback=None):
         self.token = token
         self.chat_id = int(os.getenv("TELEGRAM_CHAT_ID", 0))
         self.stop_callback = stop_callback
         self.sync_callback = sync_callback
         self.upload_logs_callback = upload_logs_callback
         self.reload_params_callback = reload_params_callback
+        self.upload_params_callback = upload_params_callback   # ← загрузка pairs.yaml на Я.Диск
 
         self.app = Application.builder().token(token).build()
 
@@ -218,22 +220,18 @@ class TelegramBot:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     # ------------------------------------------------------------
-    #  Запуск расчёта (test_*)
+    #  Запуск расчёта
     # ------------------------------------------------------------
     async def _run_calc(self, update: Update, tf: str):
-        # 1. Проверка lock
         pid = self._lock_pid()
         if pid is not None:
             await update.message.reply_text(
-                f"⚠️ Расчёт уже идёт (PID {pid}).\n"
-                f"Проверь статус: /opt_status"
+                f"⚠️ Расчёт уже идёт (PID {pid}).\nПроверь: /opt_status"
             )
             return
 
-        # 2. Записать TF
         self._write_current_tf(tf)
 
-        # 3. Запустить optimize.py
         if not self._launch_optimize(tf):
             await update.message.reply_text(
                 f"❌ Не удалось запустить расчёт для {TF_LABEL[tf]}.\n"
@@ -241,10 +239,9 @@ class TelegramBot:
             )
             return
 
-        # 4. Ответ
         await update.message.reply_text(
             f"✅ Расчёт запущен: TF={TF_LABEL[tf]}\n\n"
-            f"Время: ~30 секунд (1h), ~30 сек (30m), ~30 сек (15m)\n"
+            f"Время: ~30 секунд\n"
             f"По завершении придёт TG-уведомление.\n"
             f"Статус: /opt_status"
         )
@@ -272,7 +269,6 @@ class TelegramBot:
         else:
             lines.append("Статус: свободен")
 
-        # Последний отчёт
         report = self._latest_calc_report(tf)
         if report:
             mtime = datetime.fromtimestamp(os.path.getmtime(report)).strftime("%Y-%m-%d %H:%M")
@@ -280,13 +276,12 @@ class TelegramBot:
         else:
             lines.append(f"Отчётов для {TF_LABEL[tf]}: нет")
 
-        # Кандидат
         cand = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
         if os.path.exists(cand):
             mtime = datetime.fromtimestamp(os.path.getmtime(cand)).strftime("%Y-%m-%d %H:%M")
             lines.append(f"Кандидат: pairs_candidate_{tf}m.yaml ({mtime})")
         else:
-            lines.append(f"Кандидат: отсутствует")
+            lines.append("Кандидат: отсутствует")
 
         await update.message.reply_text("\n".join(lines))
 
@@ -317,16 +312,16 @@ class TelegramBot:
             await update.message.reply_text(f"❌ Не удалось применить: {e}")
             return
 
-        # Sync
-        sync_ok = True
-        if self.sync_callback:
+        # Загрузка pairs.yaml на Яндекс.Диск (новый callback)
+        upload_ok = True
+        if self.upload_params_callback:
             try:
-                self.sync_callback()
+                self.upload_params_callback()
             except Exception as e:
-                logger.error(f"sync failed: {e}")
-                sync_ok = False
+                logger.error(f"upload params failed: {e}")
+                upload_ok = False
 
-        # Reload
+        # Reload params в памяти бота
         reload_ok = True
         if self.reload_params_callback:
             try:
@@ -344,7 +339,7 @@ class TelegramBot:
             lines = [
                 f"✅ Применён кандидат для {TF_LABEL[tf]}",
                 f"Бэкап: {os.path.basename(backup_path)}",
-                f"Sync: {'ок' if sync_ok else 'ошибка'}",
+                f"Загрузка на Я.Диск: {'ок' if upload_ok else 'ошибка'}",
                 f"Reload: {'ок' if reload_ok else 'ошибка'}",
                 "",
                 "Параметры BTCUSDT:",

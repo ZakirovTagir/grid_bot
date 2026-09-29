@@ -3,10 +3,11 @@ main.py
 Мультивалютный демо-бот на основе свинг-точек.
 
 v4:
-- process_block вызывается с buffer_df (для новой логики MAX_DELTA_EXTREMES);
-- reload_params_callback для /apply_candidate (мутация params in-place);
+- process_block вызывается с buffer_df (новая логика MAX_DELTA_EXTREMES);
+- reload_params_callback для /apply_candidate;
+- upload_params_callback для загрузки pairs.yaml на Я.Диск;
 - CANDLE_INTERVAL = "15";
-- live-бот не торгует: OrderManager не подключён к сигналам.
+- live-бот не торгует: OrderManager не подключён.
 """
 from __future__ import annotations
 import sys
@@ -196,7 +197,7 @@ async def main():
         debug_logger.error("BTCUSDT не найден в pairs.yaml")
         return
 
-    # Функция для /apply_candidate — мутирует params in-place
+    # Callback: перечитать params из файла (после /apply_candidate)
     def reload_params_from_disk():
         try:
             with open(YAML_PATH, "r", encoding="utf-8") as f:
@@ -206,6 +207,21 @@ async def main():
             debug_logger.info("Параметры перечитаны из pairs.yaml")
         except Exception as e:
             debug_logger.error(f"reload_params_from_disk failed: {e}")
+            raise
+
+    # Callback: загрузить pairs.yaml на Яндекс.Диск (после /apply_candidate)
+    def upload_params_to_disk():
+        if not yadisk:
+            debug_logger.warning("Яндекс.Диск не инициализирован — пропуск upload")
+            return
+        try:
+            success = yadisk.upload()
+            if success:
+                debug_logger.info("pairs.yaml загружен на Яндекс.Диск")
+            else:
+                debug_logger.error("Не удалось загрузить pairs.yaml на Яндекс.Диск")
+        except Exception as e:
+            debug_logger.error(f"upload_params_to_disk failed: {e}")
             raise
 
     http_session = HTTP(testnet=False)
@@ -280,6 +296,7 @@ async def main():
             sync_callback=lambda: yadisk.sync_if_updated() if yadisk else None,
             upload_logs_callback=upload_logs_callback,
             reload_params_callback=reload_params_from_disk,
+            upload_params_callback=upload_params_to_disk,   # ← загрузка на Я.Диск
         )
         await tg.start()
         debug_logger.info("Telegram-бот запущен")
