@@ -2,11 +2,14 @@
 find_swing_points.py
 Бэктест стратегии на основе свинг-точек.
 
-Рефакторинг (optimization branch):
-- логика вынесена в функцию run_backtest(params, df);
-- все параметры передаются через словарь params;
-- добавлен расчёт max_drawdown_pct;
-- при ручном запуске (__main__) поведение идентично прежней версии.
+v3 (calc-версия):
+- MAX_DELTA_EXTREMES переосмыслен как безразмерный множитель k:
+  тело свечи мин2/макс2 не должно превышать k × avg_body свечей в диапазоне
+  от мин1/макс1 до мин2/макс2 включительно.
+- scan_mode: оба искателя работают параллельно и непрерывно.
+- Функции-сборщики статистики для расчёта параметров:
+  collect_block_amplitudes, collect_point_distances,
+  collect_body_ratios, collect_line_gaps.
 """
 
 import pandas as pd
@@ -15,25 +18,25 @@ from typing import Dict, Any, List, Optional
 
 
 # ============================================================
-#  Дефолтные параметры (для ручного запуска и как fallback)
+#  Дефолтные параметры
 # ============================================================
 DEFAULT_PARAMS = {
     # --- группа A: структура ---
     'N': 7,
     'MIN_BODY_RATIO': 0.3,
-    'DELTA_PRICE': 30,
-    'MIN_DISTANCE_BARS': 5,
-    'MAX_DELTA_EXTREMES': 500,
+    'DELTA_PRICE': 259,
+    'MIN_DISTANCE_BARS': 11,
+    'MAX_DELTA_EXTREMES': 4.0,        # теперь безразмерный множитель k
     # --- группа B: вход ---
-    'ENTRY_TOLERANCE_USD': 500,
+    'ENTRY_TOLERANCE_USD': 4.0,
     'MIN_BARS_AFTER_POINT2': 3,
-    'MAX_BARS_AFTER_POINT2': 7,
+    'MAX_BARS_AFTER_POINT2': 10,
     # --- группа C: управление позицией ---
     'MAX_LOSS_PER_TRADE': 8.0,
     'MAX_STOP_DISTANCE_PERCENT': 2.5,
     'MAX_POSITION_PERCENT': 95.0,
     'MIN_POSITION_USDT': 10.0,
-    'ACTIVATION_PROFIT_USD': 10.0,
+    'ACTIVATION_PROFIT_USD': 150.0,
     'BREAKEVEN_BARS_DELAY': 5,
     'BREAKEVEN_BIG_MOVE_USD': 100.0,
     'K1_MULT': 1.0,
@@ -45,13 +48,12 @@ DEFAULT_PARAMS = {
     'TRADING_FEE': 0.001,
 }
 
-# Пути для ручного запуска
 INPUT_CSV = "data/historical/BTCUSDT_60.csv"
 OUTPUT_LOG = "swing_points_log.txt"
 
 
 # ============================================================
-#  Вспомогательные функции
+#  Вспомогательные
 # ============================================================
 def is_noisy(row, min_body_ratio: float) -> bool:
     high = row['high']
@@ -81,6 +83,37 @@ def get_block_extremes(non_noisy):
     return (min_row[1]['low'], min_row[0]), (max_row[1]['high'], max_row[0])
 
 
+def candle_body(df: pd.DataFrame, idx: int) -> float:
+    row = df.iloc[idx]
+    return abs(float(row['close']) - float(row['open']))
+
+
+def avg_body_between(df: pd.DataFrame, idx_start: int, idx_end: int) -> float:
+    """Среднее тело свечей от idx_start до idx_end включительно."""
+    if idx_end < idx_start:
+        return 0.0
+    bodies = [candle_body(df, i) for i in range(idx_start, idx_end + 1)]
+    if not bodies:
+        return 0.0
+    return sum(bodies) / len(bodies)
+
+
+def check_body_spike(df: pd.DataFrame, idx_point1: int, idx_point2: int,
+                     k: float) -> bool:
+    """
+    True — если структура ОТБРАСЫВАЕТСЯ (тело точки 2 слишком большое).
+    False — если структура проходит фильтр.
+    k <= 0 → фильтр отключён.
+    """
+    if k <= 0:
+        return False
+    body_p2 = candle_body(df, idx_point2)
+    avg_body = avg_body_between(df, idx_point1, idx_point2)
+    if avg_body <= 0:
+        return False
+    return (body_p2 / avg_body) > k
+
+
 # ============================================================
 #  LongFinder
 # ============================================================
@@ -96,6 +129,8 @@ class LongFinder:
         self.min2_price = None
         self.min2_idx = None
         self.pending_trend = None
+        # debug info
+        self.reject_reason = None
 
     def reset(self):
         self.state = "WAIT_MIN1"
@@ -112,36 +147,30 @@ class LongFinder:
         min_body_ratio = self.params['MIN_BODY_RATIO']
         delta_price = self.params['DELTA_PRICE']
         min_distance = self.params['MIN_DISTANCE_BARS']
-        max_delta = self.params['MAX_DELTA_EXTREMES']
+        max_delta_k = self.params['MAX_DELTA_EXTREMES']
 
         non_noisy = get_block_non_noisy(block, min_body_ratio)
         if not non_noisy:
-            print(f"[LONG] Блок {block_start}-{block_start + N - 1}: все свечи шумные, пропуск.")
             return
 
         (L_price, L_idx), (H_price, H_idx) = get_block_extremes(non_noisy)
-        ts_L = self.df.iloc[L_idx]['timestamp']
-        ts_H = self.df.iloc[H_idx]['timestamp']
-        print(f"[LONG] Блок {block_start}-{block_start + N - 1}: L={L_price:.2f} ({ts_L}), H={H_price:.2f} ({ts_H})")
 
         if self.state == "WAIT_MIN1":
             if H_idx > L_idx and (H_price - L_price) >= delta_price:
                 self.min1_price, self.min1_idx = L_price, L_idx
                 self.max1_price, self.max1_idx = H_price, H_idx
                 self.state = "WAIT_MIN2"
-                print(f"[LONG] Найдены мин1 и макс1")
             else:
-                print(f"[LONG] Условия не выполнены, сброс.")
                 self.reset()
         elif self.state == "WAIT_MIN2":
             if H_price > self.max1_price:
                 self.max1_price, self.max1_idx = H_price, H_idx
-                print(f"[LONG] Обновлён макс1")
             if L_price > self.min1_price:
                 distance = L_idx - self.min1_idx
                 if distance >= min_distance and L_idx > self.max1_idx:
-                    if max_delta > 0 and (L_price - self.min1_price) > max_delta:
-                        print(f"[LONG] Разница мин2-мин1 > {max_delta}, сброс.")
+                    # НОВАЯ логика MAX_DELTA_EXTREMES: тело мин2 vs avg_body
+                    if check_body_spike(self.df, self.min1_idx, L_idx, max_delta_k):
+                        self.reject_reason = "body_spike"
                         self.reset()
                         return
                     self.min2_price, self.min2_idx = L_price, L_idx
@@ -152,14 +181,9 @@ class LongFinder:
                         'max1': (self.max1_idx, self.max1_price),
                         'min2': (self.min2_idx, self.min2_price),
                     }
-                    print(f"[LONG] Найден мин2 – ожидание входа")
-                else:
-                    print(f"[LONG] Кандидат в мин2 не подходит, ждём дальше.")
             elif L_price < self.min1_price:
-                print(f"[LONG] Перелом вниз, сброс.")
                 self.reset()
             else:
-                print(f"[LONG] L == мин1, сброс.")
                 self.reset()
 
     def check_entry(self, current_idx, current_candle):
@@ -171,14 +195,12 @@ class LongFinder:
         entry_tolerance = self.params['ENTRY_TOLERANCE_USD']
 
         if current_candle['low'] < self.min2_price:
-            print(f"[LONG] Структура нарушена")
             self.reset()
             return None
         bars_since = current_idx - self.min2_idx
         if bars_since < min_bars_after:
             return None
         if bars_since > max_bars_after:
-            print(f"[LONG] Таймаут входа")
             self.reset()
             return None
 
@@ -217,6 +239,7 @@ class ShortFinder:
         self.max2_price = None
         self.max2_idx = None
         self.pending_trend = None
+        self.reject_reason = None
 
     def reset(self):
         self.state = "WAIT_MAX1"
@@ -233,36 +256,30 @@ class ShortFinder:
         min_body_ratio = self.params['MIN_BODY_RATIO']
         delta_price = self.params['DELTA_PRICE']
         min_distance = self.params['MIN_DISTANCE_BARS']
-        max_delta = self.params['MAX_DELTA_EXTREMES']
+        max_delta_k = self.params['MAX_DELTA_EXTREMES']
 
         non_noisy = get_block_non_noisy(block, min_body_ratio)
         if not non_noisy:
-            print(f"[SHORT] Блок {block_start}-{block_start + N - 1}: все свечи шумные, пропуск.")
             return
 
         (L_price, L_idx), (H_price, H_idx) = get_block_extremes(non_noisy)
-        ts_L = self.df.iloc[L_idx]['timestamp']
-        ts_H = self.df.iloc[H_idx]['timestamp']
-        print(f"[SHORT] Блок {block_start}-{block_start + N - 1}: L={L_price:.2f} ({ts_L}), H={H_price:.2f} ({ts_H})")
 
         if self.state == "WAIT_MAX1":
             if L_idx > H_idx and (H_price - L_price) >= delta_price:
                 self.max1_price, self.max1_idx = H_price, H_idx
                 self.min1_price, self.min1_idx = L_price, L_idx
                 self.state = "WAIT_MAX2"
-                print(f"[SHORT] Найдены макс1 и мин1")
             else:
-                print(f"[SHORT] Условия не выполнены, сброс.")
                 self.reset()
         elif self.state == "WAIT_MAX2":
             if L_price < self.min1_price:
                 self.min1_price, self.min1_idx = L_price, L_idx
-                print(f"[SHORT] Обновлён мин1")
             if H_price < self.max1_price:
                 distance = H_idx - self.max1_idx
                 if distance >= min_distance and H_idx > self.min1_idx:
-                    if max_delta > 0 and (self.max1_price - H_price) > max_delta:
-                        print(f"[SHORT] Разница макс1-макс2 > {max_delta}, сброс.")
+                    # НОВАЯ логика: тело макс2 vs avg_body
+                    if check_body_spike(self.df, self.max1_idx, H_idx, max_delta_k):
+                        self.reject_reason = "body_spike"
                         self.reset()
                         return
                     self.max2_price, self.max2_idx = H_price, H_idx
@@ -273,14 +290,9 @@ class ShortFinder:
                         'min1': (self.min1_idx, self.min1_price),
                         'max2': (self.max2_idx, self.max2_price),
                     }
-                    print(f"[SHORT] Найден макс2 – ожидание входа")
-                else:
-                    print(f"[SHORT] Кандидат в макс2 не подходит, ждём дальше.")
             elif H_price > self.max1_price:
-                print(f"[SHORT] Перелом вверх, сброс.")
                 self.reset()
             else:
-                print(f"[SHORT] H == макс1, сброс.")
                 self.reset()
 
     def check_entry(self, current_idx, current_candle):
@@ -292,14 +304,12 @@ class ShortFinder:
         entry_tolerance = self.params['ENTRY_TOLERANCE_USD']
 
         if current_candle['high'] > self.max2_price:
-            print(f"[SHORT] Структура нарушена")
             self.reset()
             return None
         bars_since = current_idx - self.max2_idx
         if bars_since < min_bars_after:
             return None
         if bars_since > max_bars_after:
-            print(f"[SHORT] Таймаут входа")
             self.reset()
             return None
 
@@ -366,23 +376,182 @@ def get_active_levels(entry_price, side, structural_stop_distance, params):
 
 
 # ============================================================
-#  Ядро бэктеста
+#  Scan mode
+# ============================================================
+def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any],
+                   callback=None) -> None:
+    """
+    Прогон без открытия позиций. Оба искателя работают параллельно
+    и непрерывно. При переходе в WAIT_ENTRY — вызвать callback(finder, direction, idx)
+    и сбросить ЭТОТ finder (второй продолжает работать).
+    """
+    N = params['N']
+    long_finder = LongFinder(df, params)
+    short_finder = ShortFinder(df, params)
+
+    total = len(df)
+    buffer = []
+    block_start = 0
+
+    for i in range(total):
+        current_candle = df.iloc[i]
+        buffer.append(i)
+
+        if len(buffer) == N:
+            block = df.iloc[buffer]
+            prev_long_state = long_finder.state
+            prev_short_state = short_finder.state
+
+            long_finder.process_block(block_start, block)
+            short_finder.process_block(block_start, block)
+
+            # Проверяем переход в WAIT_ENTRY
+            if prev_long_state != "WAIT_ENTRY" and long_finder.state == "WAIT_ENTRY":
+                if callback is not None:
+                    callback("LONG", long_finder)
+                long_finder.reset()
+
+            if prev_short_state != "WAIT_ENTRY" and short_finder.state == "WAIT_ENTRY":
+                if callback is not None:
+                    callback("SHORT", short_finder)
+                short_finder.reset()
+
+            buffer = []
+            block_start = i + 1
+
+
+# ============================================================
+#  Сборщики статистики
+# ============================================================
+def collect_block_amplitudes(df: pd.DataFrame, n: int = 7) -> List[float]:
+    """Амплитуды блоков (max(high) - min(low)). Для DELTA_PRICE."""
+    amplitudes = []
+    total = len(df)
+    for start in range(0, total - n + 1, n):
+        block = df.iloc[start:start + n]
+        amp = float(block['high'].max() - block['low'].min())
+        amplitudes.append(amp)
+    return amplitudes
+
+
+def collect_point_distances(df: pd.DataFrame,
+                            base_params: Dict[str, Any]) -> List[int]:
+    """
+    Расстояния мин1→мин2 / макс1→макс2 в барах.
+    Все фильтры кроме N и MIN_BODY_RATIO отключены.
+    """
+    params = dict(base_params)
+    params['DELTA_PRICE'] = 0
+    params['MIN_DISTANCE_BARS'] = 0
+    params['MAX_DELTA_EXTREMES'] = 0
+    params['ENTRY_TOLERANCE_USD'] = 10**9
+    params['MIN_BARS_AFTER_POINT2'] = 0
+    params['MAX_BARS_AFTER_POINT2'] = 10**9
+
+    distances = []
+
+    def cb(direction, finder):
+        if direction == "LONG":
+            distances.append(int(finder.min2_idx - finder.min1_idx))
+        else:
+            distances.append(int(finder.max2_idx - finder.max1_idx))
+
+    scan_mode_pass(df, params, callback=cb)
+    return distances
+
+
+def collect_body_ratios(df: pd.DataFrame,
+                        base_params: Dict[str, Any]) -> List[float]:
+    """
+    Отношения body(мин2)/avg_body для всех структур.
+    Фильтр по телу отключён. Все остальные фильтры тоже.
+    """
+    params = dict(base_params)
+    params['DELTA_PRICE'] = 0
+    params['MIN_DISTANCE_BARS'] = 0
+    params['MAX_DELTA_EXTREMES'] = 0
+    params['ENTRY_TOLERANCE_USD'] = 10**9
+    params['MIN_BARS_AFTER_POINT2'] = 0
+    params['MAX_BARS_AFTER_POINT2'] = 10**9
+
+    ratios = []
+
+    def cb(direction, finder):
+        if direction == "LONG":
+            idx1, idx2 = finder.min1_idx, finder.min2_idx
+        else:
+            idx1, idx2 = finder.max1_idx, finder.max2_idx
+        avg_body = avg_body_between(df, idx1, idx2)
+        if avg_body <= 0:
+            return
+        body_p2 = candle_body(df, idx2)
+        ratios.append(float(body_p2 / avg_body))
+
+    scan_mode_pass(df, params, callback=cb)
+    return ratios
+
+
+def collect_line_gaps(df: pd.DataFrame,
+                      base_params: Dict[str, Any]) -> List[float]:
+    """
+    Расстояния (в USDT) от свечи до линии тренда в окне входа.
+    Собираем минимальное из |low - support| и |high - support| (для LONG)
+    и аналогично для SHORT. Если свеча пересекает линию — 0.
+    """
+    params = dict(base_params)
+    params['DELTA_PRICE'] = 0
+    params['MIN_DISTANCE_BARS'] = 0
+    params['MAX_DELTA_EXTREMES'] = 0
+    # окно входа — берём из base_params как есть
+    # ENTRY_TOLERANCE не отключаем здесь — она не влияет, потому что
+    # мы не проверяем касание, а считаем расстояние до линии вручную.
+
+    gaps = []
+
+    def cb(direction, finder):
+        if direction == "LONG":
+            idx_start = finder.min2_idx + 1
+            idx_end = finder.min2_idx + params['MAX_BARS_AFTER_POINT2']
+            idx_end = min(idx_end, len(df) - 1)
+            t1, t2 = finder.min1_idx, finder.min2_idx
+            p1, p2 = finder.min1_price, finder.min2_price
+            for i in range(idx_start, idx_end + 1):
+                row = df.iloc[i]
+                line = p1 + (p2 - p1) * (i - t1) / (t2 - t1)
+                low, high = float(row['low']), float(row['high'])
+                if low <= line <= high:
+                    gaps.append(0.0)
+                else:
+                    d = min(abs(low - line), abs(high - line))
+                    gaps.append(float(d))
+        else:
+            idx_start = finder.max2_idx + 1
+            idx_end = finder.max2_idx + params['MAX_BARS_AFTER_POINT2']
+            idx_end = min(idx_end, len(df) - 1)
+            t1, t2 = finder.max1_idx, finder.max2_idx
+            p1, p2 = finder.max1_price, finder.max2_price
+            for i in range(idx_start, idx_end + 1):
+                row = df.iloc[i]
+                line = p1 + (p2 - p1) * (i - t1) / (t2 - t1)
+                low, high = float(row['low']), float(row['high'])
+                if low <= line <= high:
+                    gaps.append(0.0)
+                else:
+                    d = min(abs(low - line), abs(high - line))
+                    gaps.append(float(d))
+
+    scan_mode_pass(df, params, callback=cb)
+    return gaps
+
+
+# ============================================================
+#  Ядро бэктеста (обычный режим)
 # ============================================================
 def run_backtest(params: Dict[str, Any],
                  df: pd.DataFrame,
                  initial_balance: float = 1000.0,
                  save_events_path: Optional[str] = None,
                  verbose: bool = False) -> Dict[str, Any]:
-    """
-    Прогоняет стратегию на df с параметрами params.
-
-    df должен иметь колонки: timestamp, open, high, low, close.
-    Индексы df должны быть range(0, len(df)) — reset_index(drop=True) перед вызовом.
-
-    Возвращает dict:
-        final_balance, net_pnl, num_trades, winning_trades, losing_trades,
-        win_rate, max_drawdown_pct, events, equity_curve
-    """
     N = params['N']
     MAX_LOSS_PER_TRADE = params['MAX_LOSS_PER_TRADE']
     MAX_STOP_DISTANCE_PERCENT = params['MAX_STOP_DISTANCE_PERCENT']
@@ -411,7 +580,6 @@ def run_backtest(params: Dict[str, Any],
 
         if position is not None:
             position['bars_since_entry'] = position.get('bars_since_entry', 0) + 1
-
             side = position['side']
             entry = position['entry_price']
             qty = position['qty']
@@ -422,7 +590,6 @@ def run_backtest(params: Dict[str, Any],
             parts_qty = position['parts_qty']
             balance_before_open = position['balance_before']
 
-            # ---- Безубыток ----
             if ACTIVATION_PROFIT_USD > 0 and not breakeven_reached:
                 if side == 'LONG':
                     high = current_candle['high']
@@ -455,11 +622,9 @@ def run_backtest(params: Dict[str, Any],
                             events.append({'type': 'breakeven_activated', 'idx': i,
                                            'price': stop_loss, 'trend': 'SHORT'})
 
-            # ---- Тейки и стоп ----
             if side == 'LONG':
                 high = current_candle['high']
                 low = current_candle['low']
-
                 if has_targets:
                     closed_parts = []
                     for part_idx, target_price in enumerate(parts_active):
@@ -476,7 +641,6 @@ def run_backtest(params: Dict[str, Any],
                             closed_parts.append(part_idx)
                     for pidx in sorted(closed_parts, reverse=True):
                         del parts_active[pidx]
-
                     if not parts_active:
                         pnl_total = balance - balance_before_open
                         events.append({
@@ -491,7 +655,6 @@ def run_backtest(params: Dict[str, Any],
                         block_start = i + 1
                         i += 1
                         continue
-
                 if low <= stop_loss:
                     exit_price = stop_loss
                     if has_targets:
@@ -514,11 +677,9 @@ def run_backtest(params: Dict[str, Any],
                     block_start = i + 1
                     i += 1
                     continue
-
-            else:  # SHORT
+            else:
                 high = current_candle['high']
                 low = current_candle['low']
-
                 if has_targets:
                     closed_parts = []
                     for part_idx, target_price in enumerate(parts_active):
@@ -535,7 +696,6 @@ def run_backtest(params: Dict[str, Any],
                             closed_parts.append(part_idx)
                     for pidx in sorted(closed_parts, reverse=True):
                         del parts_active[pidx]
-
                     if not parts_active:
                         pnl_total = balance - balance_before_open
                         events.append({
@@ -550,7 +710,6 @@ def run_backtest(params: Dict[str, Any],
                         block_start = i + 1
                         i += 1
                         continue
-
                 if high >= stop_loss:
                     exit_price = stop_loss
                     if has_targets:
@@ -574,7 +733,7 @@ def run_backtest(params: Dict[str, Any],
                     i += 1
                     continue
 
-        else:  # нет позиции — ищем вход
+        else:
             buffer.append(i)
             if len(buffer) == N:
                 block = df.iloc[buffer]
@@ -583,7 +742,7 @@ def run_backtest(params: Dict[str, Any],
                 buffer.clear()
                 block_start = i + 1
 
-            for finder, _side_label in [(long_finder, 'LONG'), (short_finder, 'SHORT')]:
+            for finder, _label in [(long_finder, 'LONG'), (short_finder, 'SHORT')]:
                 signal = finder.check_entry(i, current_candle)
                 if signal is not None:
                     entry_price = signal['entry_price']
@@ -643,7 +802,7 @@ def run_backtest(params: Dict[str, Any],
                     commission_open = position_value * TRADING_FEE
 
                     target_levels = get_active_levels(entry_price, signal['type'],
-                                                      structural_stop_distance, params)
+                                                      actual_stop_distance, params)
                     num_parts = len(target_levels)
                     has_targets = num_parts > 0
                     parts_qty = qty / num_parts if has_targets else qty
@@ -658,7 +817,6 @@ def run_backtest(params: Dict[str, Any],
                                 expected_profit += (entry_price - target) * parts_qty
 
                     balance_before = balance
-
                     if signal['type'] == 'LONG':
                         balance -= position_value + commission_open
                     else:
@@ -707,7 +865,6 @@ def run_backtest(params: Dict[str, Any],
 
         i += 1
 
-    # Закрытие позиции в конце периода
     if position is not None:
         last_price = df.iloc[-1]['close']
         if position['side'] == 'LONG':
@@ -735,7 +892,6 @@ def run_backtest(params: Dict[str, Any],
         })
         equity_curve.append(balance)
 
-    # ---- Считаем метрики ----
     total_trades = sum(1 for e in events if e['type'] == 'exit')
     profitable = 0
     losing = 0
@@ -757,7 +913,6 @@ def run_backtest(params: Dict[str, Any],
     win_rate = (profitable / total_trades) if total_trades > 0 else 0.0
     net_pnl = balance - initial_balance
 
-    # ---- Max drawdown ----
     max_dd_pct = 0.0
     if equity_curve:
         peak = equity_curve[0]
@@ -794,14 +949,10 @@ def run_backtest(params: Dict[str, Any],
 
     if save_events_path is not None:
         save_events(events, df, save_events_path)
-        print(f"Лог сохранён в {save_events_path}")
 
     return result
 
 
-# ============================================================
-#  Сохранение событий
-# ============================================================
 def save_events(events, df, path):
     with open(path, 'w', encoding='utf-8') as f:
         f.write("timestamp,event,price,trend_type,details\n")

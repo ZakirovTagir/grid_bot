@@ -1,25 +1,23 @@
 """
 utils/telegram_bot.py
-Telegram-бот для управления целями, синхронизации, оптимизатора и остановки.
+Telegram-бот для управления целями, оптимизатором и остановки.
 
 Команды:
     /set_target <SYMBOL> <PART> <PRICE>
     /stop_bot
     /sync
     /upload_logs
-    /test_1h        — выбрать TF=1h для следующего запуска оптимизатора
-    /test_30m       — выбрать TF=30m
-    /test_15m       — выбрать TF=15m
-    /opt_status     — статус оптимизатора (TF, lock, последний результат)
+    /test_1h        — выбрать TF=1h и запустить расчёт параметров
+    /test_30m       — TF=30m + запуск
+    /test_15m       — TF=15m + запуск
+    /opt_status     — статус калькулятора (TF, lock, последний результат)
     /apply_candidate — применить pairs_candidate_{tf}m.yaml поверх pairs.yaml
-
-Патч от 2026-XX-XX:
-- deleteWebhook при старте + retry на Conflict;
-- новые команды для оптимизатора.
 """
 import os
+import sys
 import logging
 import asyncio
+import subprocess
 import shutil
 import yaml
 from datetime import datetime
@@ -36,6 +34,8 @@ CONFIG_DIR = os.path.join(BASE_DIR, "config")
 STATE_FILE = os.path.join(OPTIMIZATION_DIR, "current_tf.txt")
 LOCK_FILE = os.path.join(OPTIMIZATION_DIR, "optimize.lock")
 RESULTS_DIR = os.path.join(OPTIMIZATION_DIR, "results")
+OPTIMIZE_SCRIPT = os.path.join(BASE_DIR, "optimize.py")
+OPTIMIZE_LOG = os.path.join(OPTIMIZATION_DIR, "optimize_launch.log")
 
 ALLOWED_TF = {"60", "30", "15"}
 TF_LABEL = {"60": "1h", "30": "30m", "15": "15m"}
@@ -50,6 +50,7 @@ class TelegramBot:
         self.sync_callback = sync_callback
         self.upload_logs_callback = upload_logs_callback
         self.reload_params_callback = reload_params_callback
+
         self.app = Application.builder().token(token).build()
 
         # основные
@@ -73,13 +74,10 @@ class TelegramBot:
         try:
             info = await self.app.bot.get_webhook_info()
             if info.url:
-                logger.warning(f"Обнаружен webhook: {info.url} — удаляю")
+                logger.warning(f"Webhook найден: {info.url}, удаляю")
                 await self.app.bot.delete_webhook(drop_pending_updates=False)
-                logger.info("Webhook удалён")
-            else:
-                logger.info("Webhook отсутствует")
         except TelegramError as e:
-            logger.error(f"Ошибка проверки webhook: {e}")
+            logger.error(f"webhook check failed: {e}")
 
     async def start(self, max_retries: int = 5, retry_delay: int = 10):
         await self.app.initialize()
@@ -95,7 +93,6 @@ class TelegramBot:
                 if attempt < max_retries:
                     await asyncio.sleep(retry_delay)
                 else:
-                    logger.error("Polling не удалось запустить")
                     raise
 
     async def stop(self):
@@ -141,15 +138,33 @@ class TelegramBot:
         except (ValueError, ProcessLookupError, PermissionError):
             return None
 
-    def _latest_results_file(self):
+    def _latest_calc_report(self, tf: str):
         if not os.path.isdir(RESULTS_DIR):
             return None
-        files = [os.path.join(RESULTS_DIR, x) for x in os.listdir(RESULTS_DIR)]
-        files = [x for x in files if x.endswith(".csv")]
+        files = [os.path.join(RESULTS_DIR, x) for x in os.listdir(RESULTS_DIR)
+                 if x.endswith(f"_{tf}m_calc_report.txt")]
         if not files:
             return None
         files.sort(key=os.path.getmtime, reverse=True)
         return files[0]
+
+    def _launch_optimize(self, tf: str) -> bool:
+        """Запускает optimize.py в фоне как detached процесс."""
+        os.makedirs(OPTIMIZATION_DIR, exist_ok=True)
+        log_file = open(OPTIMIZE_LOG, "a")
+        try:
+            subprocess.Popen(
+                [sys.executable, "-u", OPTIMIZE_SCRIPT, "--tf", tf],
+                cwd=BASE_DIR,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"launch optimize failed: {e}")
+            return False
 
     # ------------------------------------------------------------
     #  Оригинальные команды
@@ -159,7 +174,7 @@ class TelegramBot:
             parts = context.args
             if len(parts) != 3:
                 await update.message.reply_text(
-                    "Формат: /set_target SYMBOL PART PRICE\nПример: /set_target BTCUSDT 1 85000")
+                    "Формат: /set_target SYMBOL PART PRICE")
                 return
             symbol = parts[0].upper()
             part = int(parts[1])
@@ -169,16 +184,16 @@ class TelegramBot:
                 return
             self.load_params()
             if symbol not in self.params:
-                await update.message.reply_text(f"Пара {symbol} не найдена в конфиге")
+                await update.message.reply_text(f"{symbol} не найдена")
                 return
             self.params[symbol][f"TRAILING_PRICE{part}"] = price
             self.save_params()
-            await update.message.reply_text(f"✅ {symbol} TRAILING_PRICE{part} = {price:.2f} USD")
+            await update.message.reply_text(f"✅ {symbol} TRAILING_PRICE{part} = {price:.2f}")
         except Exception as e:
             await update.message.reply_text(f"Ошибка: {e}")
 
     async def stop_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Останавливаю бота и закрываю все позиции...")
+        await update.message.reply_text("Останавливаю бота...")
         if self.stop_callback:
             self.stop_callback()
 
@@ -196,59 +211,82 @@ class TelegramBot:
         await update.message.reply_text("Начинаю выгрузку логов...")
         try:
             success = await self.upload_logs_callback()
-            if success:
-                await update.message.reply_text("✅ Логи выгружены.")
-            else:
-                await update.message.reply_text("❌ Не удалось выгрузить логи.")
+            msg = "✅ Логи выгружены." if success else "❌ Не удалось выгрузить."
+            await update.message.reply_text(msg)
         except Exception as e:
-            logger.error(f"Ошибка выгрузки: {e}")
+            logger.error(f"upload_logs failed: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     # ------------------------------------------------------------
-    #  Выбор TF
+    #  Запуск расчёта (test_*)
     # ------------------------------------------------------------
-    async def _set_tf(self, update: Update, tf: str):
+    async def _run_calc(self, update: Update, tf: str):
+        # 1. Проверка lock
+        pid = self._lock_pid()
+        if pid is not None:
+            await update.message.reply_text(
+                f"⚠️ Расчёт уже идёт (PID {pid}).\n"
+                f"Проверь статус: /opt_status"
+            )
+            return
+
+        # 2. Записать TF
         self._write_current_tf(tf)
+
+        # 3. Запустить optimize.py
+        if not self._launch_optimize(tf):
+            await update.message.reply_text(
+                f"❌ Не удалось запустить расчёт для {TF_LABEL[tf]}.\n"
+                f"См. лог: {OPTIMIZE_LOG}"
+            )
+            return
+
+        # 4. Ответ
         await update.message.reply_text(
-            f"✅ TF для следующего запуска оптимизатора: {TF_LABEL[tf]}\n"
-            f"Файл: {STATE_FILE}\n"
-            f"Запуск — по cron в воскресенье 03:00 (SGT)."
+            f"✅ Расчёт запущен: TF={TF_LABEL[tf]}\n\n"
+            f"Время: ~30 секунд (1h), ~30 сек (30m), ~30 сек (15m)\n"
+            f"По завершении придёт TG-уведомление.\n"
+            f"Статус: /opt_status"
         )
 
     async def test_1h(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._set_tf(update, "60")
+        await self._run_calc(update, "60")
 
     async def test_30m(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._set_tf(update, "30")
+        await self._run_calc(update, "30")
 
     async def test_15m(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._set_tf(update, "15")
+        await self._run_calc(update, "15")
 
     # ------------------------------------------------------------
-    #  Статус оптимизатора
+    #  Статус
     # ------------------------------------------------------------
     async def opt_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         tf = self._read_current_tf()
         pid = self._lock_pid()
-        latest = self._latest_results_file()
 
-        lines = [
-            f"Текущий TF: {TF_LABEL[tf]} ({tf})",
-            f"State-файл: {os.path.exists(STATE_FILE)}",
-            f"Lock-файл: {'PID ' + str(pid) + ' (работает)' if pid else 'свободен'}",
-        ]
-        if latest:
-            mtime = datetime.fromtimestamp(os.path.getmtime(latest)).strftime("%Y-%m-%d %H:%M")
-            lines.append(f"Последний результат: {os.path.basename(latest)} ({mtime})")
-        else:
-            lines.append("Результатов ещё нет")
+        lines = [f"Текущий TF: {TF_LABEL[tf]} ({tf})"]
 
-        cand_path = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
-        if os.path.exists(cand_path):
-            mtime = datetime.fromtimestamp(os.path.getmtime(cand_path)).strftime("%Y-%m-%d %H:%M")
-            lines.append(f"Кандидат: {os.path.basename(cand_path)} ({mtime})")
+        if pid is not None:
+            lines.append(f"Статус: ⏳ расчёт идёт (PID {pid})")
         else:
-            lines.append(f"Кандидат для {TF_LABEL[tf]}: отсутствует")
+            lines.append("Статус: свободен")
+
+        # Последний отчёт
+        report = self._latest_calc_report(tf)
+        if report:
+            mtime = datetime.fromtimestamp(os.path.getmtime(report)).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"Последний отчёт: {os.path.basename(report)} ({mtime})")
+        else:
+            lines.append(f"Отчётов для {TF_LABEL[tf]}: нет")
+
+        # Кандидат
+        cand = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
+        if os.path.exists(cand):
+            mtime = datetime.fromtimestamp(os.path.getmtime(cand)).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"Кандидат: pairs_candidate_{tf}m.yaml ({mtime})")
+        else:
+            lines.append(f"Кандидат: отсутствует")
 
         await update.message.reply_text("\n".join(lines))
 
@@ -264,41 +302,40 @@ class TelegramBot:
                 f"❌ Нет кандидата для {TF_LABEL[tf]} ({cand_path})")
             return
 
-        # Бэкап текущего pairs.yaml
-        backup_path = os.path.join(CONFIG_DIR,
-                                   f"pairs_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml")
+        # Бэкап
+        backup_path = os.path.join(
+            CONFIG_DIR, f"pairs_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml")
         try:
             shutil.copy2(YAML_PATH, backup_path)
         except Exception as e:
-            await update.message.reply_text(f"❌ Не удалось создать бэкап: {e}")
+            await update.message.reply_text(f"❌ Бэкап не создан: {e}")
             return
 
-        # Копирование кандидата поверх
         try:
             shutil.copy2(cand_path, YAML_PATH)
         except Exception as e:
             await update.message.reply_text(f"❌ Не удалось применить: {e}")
             return
 
-        # Синхронизация с Яндекс.Диском (если есть callback)
+        # Sync
         sync_ok = True
         if self.sync_callback:
             try:
                 self.sync_callback()
             except Exception as e:
-                logger.error(f"Ошибка sync: {e}")
+                logger.error(f"sync failed: {e}")
                 sync_ok = False
 
-        # Перечитать params в памяти
+        # Reload
         reload_ok = True
         if self.reload_params_callback:
             try:
                 self.reload_params_callback()
             except Exception as e:
-                logger.error(f"Ошибка reload: {e}")
+                logger.error(f"reload failed: {e}")
                 reload_ok = False
 
-        # Читаем итоговые параметры, чтобы показать отчёт
+        # Показать что применилось
         try:
             with open(YAML_PATH, "r", encoding="utf-8") as f:
                 new_cfg = yaml.safe_load(f) or {}
@@ -307,8 +344,8 @@ class TelegramBot:
             lines = [
                 f"✅ Применён кандидат для {TF_LABEL[tf]}",
                 f"Бэкап: {os.path.basename(backup_path)}",
-                f"Синхронизация с Я.Диск: {'ок' if sync_ok else 'ошибка'}",
-                f"Перечитано в память: {'ок' if reload_ok else 'ошибка'}",
+                f"Sync: {'ок' if sync_ok else 'ошибка'}",
+                f"Reload: {'ок' if reload_ok else 'ошибка'}",
                 "",
                 "Параметры BTCUSDT:",
             ]
@@ -319,11 +356,12 @@ class TelegramBot:
                     lines.append(f"  {k} = {btc[k]}")
             if info:
                 lines.append("")
-                lines.append(f"IS net: {info.get('is_net_pnl')} trades: {info.get('is_trades')}")
-                lines.append(f"OOS net: {info.get('oos_net_pnl')} trades: {info.get('oos_trades')}")
+                lines.append(f"net_pnl: {info.get('net_pnl')}")
+                lines.append(f"trades: {info.get('num_trades')}")
+                lines.append(f"win_rate: {info.get('win_rate')}")
             await update.message.reply_text("\n".join(lines))
         except Exception as e:
-            await update.message.reply_text(f"⚠️ Применено, но не удалось прочитать итог: {e}")
+            await update.message.reply_text(f"⚠️ Применено, но ошибка чтения: {e}")
 
     # ------------------------------------------------------------
     #  Уведомления
@@ -333,6 +371,4 @@ class TelegramBot:
             try:
                 await self.app.bot.send_message(chat_id=self.chat_id, text=text)
             except Exception as e:
-                logger.error(f"Ошибка отправки уведомления: {e}")
-        else:
-            logger.warning("TELEGRAM_CHAT_ID не задан")
+                logger.error(f"Ошибка отправки: {e}")

@@ -1,15 +1,21 @@
 """
-optimize.py — оптимизатор параметров стратегии свинг-точек.
+optimize.py — калькулятор параметров стратегии свинг-точек.
 
-- lock-файл против параллельных запусков;
-- прогресс в Telegram раз в 6 часов;
-- перебор полного grid на IS;
-- OOS-проверка топ-30;
-- при успехе — pairs_candidate_{tf}.yaml + уведомление.
-
-Запуск (на сервере):
-    source venv/bin/activate
-    nohup python -u optimize.py --tf 15 --workers 2 > optimization/run_15m.log 2>&1 &
+Логика:
+- читает TF из optimization/current_tf.txt (или --tf);
+- при расчёте каждого параметра ВСЕ остальные отключены;
+- scan mode: оба искателя работают параллельно;
+- считает 4 параметра:
+    DELTA_PRICE        — 30 дней — медиана амплитуд блоков (trimmed 10%) × 0.25
+    MIN_DISTANCE_BARS  — 90 дней — 25-й процентиль расстояний (trimmed 10%)
+    ENTRY_TOLERANCE_USD— 30 дней — медиана недоходов до линии (trimmed 10%) × 1.5
+    MAX_DELTA_EXTREMES — жёстко 4.0
+- в конце — финальный бэктест с рассчитанными параметрами;
+- пишет config/pairs_candidate_{tf}m.yaml;
+- пишет txt-отчёт в optimization/results/;
+- загружает кандидата и отчёт на Яндекс.Диск;
+- отправляет TG-уведомления (старт и финал);
+- lock-файл для защиты от параллельных запусков.
 """
 
 import os
@@ -17,16 +23,15 @@ import sys
 import io
 import time
 import argparse
-import itertools
 import signal
 import contextlib
 import traceback
-import multiprocessing as mp
 import urllib.request
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
+import numpy as np
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
@@ -35,7 +40,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from find_swing_points import run_backtest, DEFAULT_PARAMS
+from find_swing_points import (
+    run_backtest, DEFAULT_PARAMS,
+    collect_block_amplitudes,
+    collect_point_distances,
+    collect_body_ratios,
+    collect_line_gaps,
+)
 from scripts.fetch_history import fetch_history
 
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -56,18 +67,28 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(OPTIMIZATION_DIR, exist_ok=True)
 
 DEFAULT_TF = "60"
-IS_MONTHS = 4
-OOS_MONTHS = 2
-TOTAL_DAYS = (IS_MONTHS + OOS_MONTHS) * 30
+ALLOWED_TF = {"60", "30", "15"}
 
-TOP_N_FOR_OOS = 30
-OOS_MIN_TRADES = 10
-OOS_MIN_NET_PNL = 0.0
+# Периоды расчёта
+DAYS_DELTA = 30
+DAYS_DISTANCE = 90
+DAYS_TOLERANCE = 30
 
-PROGRESS_INTERVAL_SEC = 6 * 3600
+# Коэффициенты
+DELTA_K = 0.25
+TOLERANCE_K = 1.5
+TRIM_PCT = 0.10
+
+# Жёстко захардкоженные
+HARD_N = 7
+HARD_MIN_BODY_RATIO = 0.3
+HARD_MAX_DELTA_EXTREMES = 4.0
+HARD_MIN_BARS_AFTER = 3
+HARD_MAX_BARS_AFTER = 10
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+YADISK_TOKEN = os.getenv("YADISK_TOKEN")
 
 
 # ============================================================
@@ -75,7 +96,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ============================================================
 def tg_send(text: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[tg] skipped (no token/chat_id): {text[:80]}", flush=True)
+        print(f"[tg] skipped: {text[:80]}", flush=True)
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -113,50 +134,13 @@ def release_lock() -> None:
 
 
 # ============================================================
-#  Сетки
-# ============================================================
-GRIDS: Dict[str, Dict[str, List[Any]]] = {
-    "60": {
-        "N": [5, 7, 9],
-        "MIN_BODY_RATIO": [0.1, 0.3, 0.5],
-        "DELTA_PRICE": [50, 100, 200, 500, 1000],
-        "MIN_DISTANCE_BARS": [3, 5, 10],
-        "MAX_DELTA_EXTREMES": [300, 500, 1000, 2000, 5000],
-        "ENTRY_TOLERANCE_USD": [50, 200, 500, 1000],
-        "MIN_BARS_AFTER_POINT2": [2, 3, 5],
-        "MAX_BARS_AFTER_POINT2": [5, 7, 10],
-    },
-    "30": {
-        "N": [5, 7, 9],
-        "MIN_BODY_RATIO": [0.1, 0.3, 0.5],
-        "DELTA_PRICE": [25, 50, 100, 250, 500],
-        "MIN_DISTANCE_BARS": [3, 5, 10],
-        "MAX_DELTA_EXTREMES": [150, 250, 500, 1000, 2500],
-        "ENTRY_TOLERANCE_USD": [25, 100, 250, 500],
-        "MIN_BARS_AFTER_POINT2": [2, 3, 5],
-        "MAX_BARS_AFTER_POINT2": [5, 7, 10],
-    },
-    "15": {
-        "N": [5, 7, 9],
-        "MIN_BODY_RATIO": [0.1, 0.3, 0.5],
-        "DELTA_PRICE": [12, 25, 50, 120, 250],
-        "MIN_DISTANCE_BARS": [3, 5, 10],
-        "MAX_DELTA_EXTREMES": [75, 125, 250, 500, 1250],
-        "ENTRY_TOLERANCE_USD": [12, 50, 125, 250],
-        "MIN_BARS_AFTER_POINT2": [2, 3, 5],
-        "MAX_BARS_AFTER_POINT2": [5, 7, 10],
-    },
-}
-
-
-# ============================================================
 #  Вспомогательное
 # ============================================================
 def read_current_tf() -> str:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             tf = f.read().strip()
-        if tf in GRIDS:
+        if tf in ALLOWED_TF:
             return tf
     return DEFAULT_TF
 
@@ -177,79 +161,107 @@ def ensure_csv(tf: str, days_back: int) -> str:
     return path
 
 
-def load_and_split(csv_path: str, is_months: int, oos_months: int):
+def load_df(csv_path: str, days_back: int) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
-
-    end_date = df["timestamp"].max()
-    total_months = is_months + oos_months
-    is_start = end_date - pd.DateOffset(months=total_months)
-    oos_start = end_date - pd.DateOffset(months=oos_months)
-
-    is_df = df[(df["timestamp"] >= is_start) & (df["timestamp"] < oos_start)].copy()
-    oos_df = df[df["timestamp"] >= oos_start].copy()
-    is_df.reset_index(drop=True, inplace=True)
-    oos_df.reset_index(drop=True, inplace=True)
-    return is_df, oos_df
+    # берём последние days_back дней
+    end = df["timestamp"].max()
+    start = end - pd.Timedelta(days=days_back)
+    df = df[df["timestamp"] >= start].reset_index(drop=True)
+    return df
 
 
-def compute_score(metrics: Dict[str, Any]) -> float:
-    net_pnl = metrics["net_pnl"]
-    if net_pnl <= 0:
-        return float(net_pnl)
-    num_trades = metrics["num_trades"]
-    win_rate = metrics["win_rate"]
-    max_dd = metrics["max_drawdown_pct"]
-    trade_factor = min(1.0, num_trades / 30.0)
-    dd_factor = max(0.0, 1.0 - max_dd / 100.0)
-    wr_factor = win_rate ** 0.5
-    return net_pnl * trade_factor * dd_factor * wr_factor
+def trimmed_percentile(values: List[float], pct: float,
+                       trim_pct: float = TRIM_PCT) -> float:
+    """Trimmed percentile: отбрасываем по trim_pct с каждой стороны, берём pct."""
+    if not values:
+        return 0.0
+    arr = np.array(values, dtype=float)
+    if len(arr) < 5:
+        return float(np.percentile(arr, pct * 100))
+    lo = np.percentile(arr, trim_pct * 100)
+    hi = np.percentile(arr, (1 - trim_pct) * 100)
+    trimmed = arr[(arr >= lo) & (arr <= hi)]
+    if len(trimmed) == 0:
+        trimmed = arr
+    return float(np.percentile(trimmed, pct * 100))
 
 
-def generate_combinations(grid: Dict[str, List[Any]]):
-    keys = list(grid.keys())
-    for combo in itertools.product(*[grid[k] for k in keys]):
-        yield dict(zip(keys, combo))
+def trimmed_median(values: List[float],
+                   trim_pct: float = TRIM_PCT) -> float:
+    if not values:
+        return 0.0
+    arr = np.array(values, dtype=float)
+    if len(arr) < 5:
+        return float(np.median(arr))
+    lo = np.percentile(arr, trim_pct * 100)
+    hi = np.percentile(arr, (1 - trim_pct) * 100)
+    trimmed = arr[(arr >= lo) & (arr <= hi)]
+    if len(trimmed) == 0:
+        trimmed = arr
+    return float(np.median(trimmed))
 
 
 # ============================================================
-#  Multiprocessing worker
+#  Расчёт параметров
 # ============================================================
-_IS_DF = None
-_BALANCE = 1000.0
+def calc_delta_price(tf: str) -> float:
+    """Медиана амплитуд блоков (30 дней) × 0.25."""
+    print(f"\n[CALC] DELTA_PRICE — окно {DAYS_DELTA} дней", flush=True)
+    csv_path = ensure_csv(tf, DAYS_DISTANCE)   # берём больше данных, обрежем
+    df = load_df(csv_path, DAYS_DELTA)
+
+    amplitudes = collect_block_amplitudes(df, n=HARD_N)
+    med = trimmed_median(amplitudes)
+    delta = med * DELTA_K
+
+    print(f"  собрано амплитуд блоков: {len(amplitudes)}", flush=True)
+    print(f"  медиана (trimmed {int(TRIM_PCT*100)}%): {med:.2f}", flush=True)
+    print(f"  DELTA_PRICE = {med:.2f} × {DELTA_K} = {delta:.2f}", flush=True)
+    return round(delta, 2)
 
 
-def _worker_init(is_df, balance):
-    global _IS_DF, _BALANCE
-    _IS_DF = is_df
-    _BALANCE = balance
+def calc_min_distance_bars(tf: str) -> int:
+    """25-й процентиль расстояний между точками (90 дней)."""
+    print(f"\n[CALC] MIN_DISTANCE_BARS — окно {DAYS_DISTANCE} дней", flush=True)
+    csv_path = ensure_csv(tf, DAYS_DISTANCE)
+    df = load_df(csv_path, DAYS_DISTANCE)
+
+    base = dict(DEFAULT_PARAMS)
+    base['N'] = HARD_N
+    base['MIN_BODY_RATIO'] = HARD_MIN_BODY_RATIO
+    distances = collect_point_distances(df, base)
+    p25 = trimmed_percentile(distances, 0.25)
+
+    print(f"  собрано расстояний: {len(distances)}", flush=True)
+    if distances:
+        print(f"  min={min(distances)}, max={max(distances)}", flush=True)
+    print(f"  MIN_DISTANCE_BARS = 25-й перцентиль = {p25:.2f}", flush=True)
+    return int(round(p25))
 
 
-def _worker(combo):
-    params = dict(DEFAULT_PARAMS)
-    params.update(combo)
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            metrics = run_backtest(params, _IS_DF, initial_balance=_BALANCE,
-                                   save_events_path=None, verbose=False)
-    except Exception as e:
-        return {
-            "error": f"{type(e).__name__}: {e}",
-            "trace": traceback.format_exc()[:800],
-            "combo": combo,
-        }
-    row = dict(combo)
-    row.update({
-        "score": compute_score(metrics),
-        "net_pnl": metrics["net_pnl"],
-        "num_trades": metrics["num_trades"],
-        "win_rate": metrics["win_rate"],
-        "max_drawdown_pct": metrics["max_drawdown_pct"],
-    })
-    return row
+def calc_entry_tolerance(tf: str) -> float:
+    """Медиана недоходов до линии (30 дней) × 1.5."""
+    print(f"\n[CALC] ENTRY_TOLERANCE_USD — окно {DAYS_TOLERANCE} дней", flush=True)
+    csv_path = ensure_csv(tf, DAYS_DISTANCE)
+    df = load_df(csv_path, DAYS_TOLERANCE)
+
+    base = dict(DEFAULT_PARAMS)
+    base['N'] = HARD_N
+    base['MIN_BODY_RATIO'] = HARD_MIN_BODY_RATIO
+    base['MIN_BARS_AFTER_POINT2'] = HARD_MIN_BARS_AFTER
+    base['MAX_BARS_AFTER_POINT2'] = HARD_MAX_BARS_AFTER
+
+    gaps = collect_line_gaps(df, base)
+    med = trimmed_median(gaps)
+    tol = med * TOLERANCE_K
+
+    print(f"  собрано недоходов: {len(gaps)}", flush=True)
+    print(f"  медиана (trimmed): {med:.2f}", flush=True)
+    print(f"  ENTRY_TOLERANCE_USD = {med:.2f} × {TOLERANCE_K} = {tol:.2f}", flush=True)
+    return round(tol, 2)
 
 
 # ============================================================
@@ -261,24 +273,20 @@ PARAM_KEYS_ORDER = [
 ]
 
 
-def write_candidate(tf: str, best_params: Dict[str, Any],
-                    is_metrics: Dict, oos_metrics: Dict) -> str:
+def write_candidate(tf: str, new_params: Dict[str, Any], metrics: Dict) -> str:
     with open(PAIRS_YAML, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     if "BTCUSDT" not in cfg:
         cfg["BTCUSDT"] = {}
-    for k, v in best_params.items():
+    for k, v in new_params.items():
         cfg["BTCUSDT"][k] = v
     cfg["BTCUSDT"]["_optimization"] = {
         "tf": tf,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "is_score": round(compute_score(is_metrics), 3),
-        "is_net_pnl": is_metrics["net_pnl"],
-        "is_trades": is_metrics["num_trades"],
-        "is_win_rate": is_metrics["win_rate"],
-        "oos_net_pnl": oos_metrics["net_pnl"],
-        "oos_trades": oos_metrics["num_trades"],
-        "oos_win_rate": oos_metrics["win_rate"],
+        "num_trades": metrics["num_trades"],
+        "net_pnl": metrics["net_pnl"],
+        "win_rate": metrics["win_rate"],
+        "max_drawdown_pct": metrics["max_drawdown_pct"],
     }
     out_path = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -287,168 +295,156 @@ def write_candidate(tf: str, best_params: Dict[str, Any],
 
 
 # ============================================================
+#  Отчёт
+# ============================================================
+def build_report(tf: str, old_params: Dict, new_params: Dict,
+                 metrics: Dict, durations: Dict) -> str:
+    lines = []
+    lines.append("=" * 60)
+    lines.append(f"ОТЧЁТ РАСЧЁТА ПАРАМЕТРОВ  [{tf}m]")
+    lines.append(f"Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("=" * 60)
+    lines.append("")
+    lines.append("--- СТАРЫЕ ЗНАЧЕНИЯ ---")
+    for k in PARAM_KEYS_ORDER:
+        lines.append(f"  {k} = {old_params.get(k, '?')}")
+    lines.append("")
+    lines.append("--- НОВЫЕ ЗНАЧЕНИЯ ---")
+    for k in PARAM_KEYS_ORDER:
+        old_v = old_params.get(k, '?')
+        new_v = new_params.get(k, '?')
+        lines.append(f"  {k} = {old_v}/{new_v}")
+    lines.append("")
+    lines.append("--- ВРЕМЯ РАСЧЁТА ---")
+    for k, t in durations.items():
+        lines.append(f"  {k}: {t:.1f} сек")
+    lines.append("")
+    lines.append("--- ФИНАЛЬНЫЙ БЭКТЕСТ (с рассчитанными параметрами) ---")
+    lines.append(f"  net_pnl: {metrics['net_pnl']} USDT")
+    lines.append(f"  final_balance: {metrics['final_balance']} USDT")
+    lines.append(f"  num_trades: {metrics['num_trades']}")
+    lines.append(f"  win_rate: {metrics['win_rate']}")
+    lines.append(f"  max_drawdown_pct: {metrics['max_drawdown_pct']}%")
+    lines.append("")
+    lines.append("Применить: /apply_candidate")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+# ============================================================
+#  Яндекс.Диск
+# ============================================================
+def upload_to_yadisk(local_path: str, remote_path: str) -> bool:
+    if not YADISK_TOKEN:
+        print(f"[yadisk] skipped (no token): {remote_path}", flush=True)
+        return False
+    try:
+        from utils.yadisk_sync import YaDiskSync
+        yd = YaDiskSync(YADISK_TOKEN, local_path, remote_path=remote_path)
+        if yd.client.exists(remote_path):
+            yd.client.remove(remote_path)
+        return yd.upload_file(local_path, remote_path)
+    except Exception as e:
+        print(f"[yadisk] upload failed: {e}", flush=True)
+        return False
+
+
+# ============================================================
 #  Основной цикл
 # ============================================================
-def run_optimization(tf: str, workers: int = 1, limit: Optional[int] = None,
-                     initial_balance: float = 1000.0):
-    csv_path = ensure_csv(tf, TOTAL_DAYS)
-    is_df, oos_df = load_and_split(csv_path, IS_MONTHS, OOS_MONTHS)
-    print(f"IS : {len(is_df)} свечей ({is_df['timestamp'].min()} .. {is_df['timestamp'].max()})", flush=True)
-    print(f"OOS: {len(oos_df)} свечей ({oos_df['timestamp'].min()} .. {oos_df['timestamp'].max()})", flush=True)
+def run_calc(tf: str):
+    print(f"=== Калькулятор параметров === TF: {tf}m", flush=True)
+    print(f"Окна: DELTA={DAYS_DELTA}д, DISTANCE={DAYS_DISTANCE}д, TOLERANCE={DAYS_TOLERANCE}д",
+          flush=True)
 
-    combos = list(generate_combinations(GRIDS[tf]))
-    if limit is not None:
-        combos = combos[:limit]
-    total = len(combos)
-    print(f"Всего комбинаций: {total}, workers={workers}", flush=True)
+    tg_send(f"Калькулятор параметров запущен: TF={tf}m")
 
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
-    is_csv = os.path.join(RESULTS_DIR, f"{ts}_{tf}m_IS.csv")
-    oos_csv = os.path.join(RESULTS_DIR, f"{ts}_{tf}m_OOS.csv")
+    # Старые параметры
+    with open(PAIRS_YAML, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    old_params = dict(cfg.get("BTCUSDT", {}))
 
-    tg_send(f"Оптимизатор запущен: TF={tf}m, комбо={total}, workers={workers}")
-
-    results: List[Dict[str, Any]] = []
-    errors_printed = 0
     t_start = time.time()
-    last_report = t_start
+    durations = {}
 
-    def _handle_row(row, i):
-        nonlocal last_report, errors_printed
-        if row is None:
-            return
-        if isinstance(row, dict) and "error" in row:
-            if errors_printed < 3:
-                print(f"[error #{i}] {row['error']}", flush=True)
-                print(row.get("trace", "")[:600], flush=True)
-                print(f"combo: {row['combo']}", flush=True)
-                errors_printed += 1
-            return
-        results.append(row)
+    # 1. DELTA_PRICE
+    t0 = time.time()
+    new_delta = calc_delta_price(tf)
+    durations['DELTA_PRICE'] = time.time() - t0
 
-        if (i + 1) % 50 == 0 or (i + 1) == total:
-            elapsed = time.time() - t_start
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (total - i - 1) / rate if rate > 0 else 0
-            best = max((r['score'] for r in results), default=float('-inf'))
-            print(f"[{i+1}/{total}] ok={len(results)} elapsed={elapsed:.0f}s "
-                  f"ETA={eta:.0f}s best={best:.2f}", flush=True)
+    # 2. MIN_DISTANCE_BARS
+    t0 = time.time()
+    new_distance = calc_min_distance_bars(tf)
+    durations['MIN_DISTANCE_BARS'] = time.time() - t0
 
-        if time.time() - last_report > PROGRESS_INTERVAL_SEC:
-            elapsed = time.time() - t_start
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (total - i - 1) / rate if rate > 0 else 0
-            best = max((r['score'] for r in results), default=0)
-            tg_send(f"Оптимизатор [{tf}m]: {i+1}/{total} "
-                    f"({(i+1)/total*100:.1f}%), ETA {eta/3600:.1f}ч, "
-                    f"best_score={best:.2f}, ok={len(results)}")
-            last_report = time.time()
+    # 3. ENTRY_TOLERANCE_USD
+    t0 = time.time()
+    new_tolerance = calc_entry_tolerance(tf)
+    durations['ENTRY_TOLERANCE_USD'] = time.time() - t0
 
-    if workers > 1:
-        with mp.Pool(workers, initializer=_worker_init,
-                     initargs=(is_df, initial_balance)) as pool:
-            for i, row in enumerate(pool.imap_unordered(_worker, combos, chunksize=5)):
-                _handle_row(row, i)
-    else:
-        _worker_init(is_df, initial_balance)
-        for i, combo in enumerate(combos):
-            row = _worker(combo)
-            _handle_row(row, i)
+    # Сборка новых параметров
+    new_params = {
+        'N': HARD_N,
+        'MIN_BODY_RATIO': HARD_MIN_BODY_RATIO,
+        'DELTA_PRICE': new_delta,
+        'MIN_DISTANCE_BARS': new_distance,
+        'MAX_DELTA_EXTREMES': HARD_MAX_DELTA_EXTREMES,
+        'ENTRY_TOLERANCE_USD': new_tolerance,
+        'MIN_BARS_AFTER_POINT2': HARD_MIN_BARS_AFTER,
+        'MAX_BARS_AFTER_POINT2': HARD_MAX_BARS_AFTER,
+    }
 
-    is_df_result = pd.DataFrame(results)
-    if not is_df_result.empty:
-        is_df_result.sort_values("score", ascending=False, inplace=True)
-    is_df_result.to_csv(is_csv, index=False)
-    print(f"\nIS результатов: {len(is_df_result)} (из {total} комбо, "
-          f"ошибок: {errors_printed if errors_printed < 3 else '3+'} )", flush=True)
-    print(f"IS → {is_csv}", flush=True)
-    print(f"Total time (IS): {time.time() - t_start:.1f}s", flush=True)
+    print(f"\n=== РАСЧЁТ ЗАВЕРШЁН за {time.time()-t_start:.1f} сек ===", flush=True)
+    for k in PARAM_KEYS_ORDER:
+        print(f"  {k} = {old_params.get(k, '?')} → {new_params[k]}", flush=True)
 
-    if is_df_result.empty:
-        tg_send(f"Оптимизатор [{tf}m]: пустой результат, кандидат не создан")
-        return
-
-    print("\n=== TOP-5 (IS) ===", flush=True)
-    for _, r in is_df_result.head(5).iterrows():
-        print(f"score={r['score']:.2f} net={r['net_pnl']:.2f} "
-              f"trades={r['num_trades']:.0f} wr={r['win_rate']:.3f} "
-              f"dd={r['max_drawdown_pct']:.2f}%", flush=True)
-
-    # ---- OOS-проверка топ-N ----
-    top = is_df_result.head(TOP_N_FOR_OOS)
-    print(f"\nOOS-проверка топ-{len(top)}...", flush=True)
-
-    oos_results = []
-    for _, row in top.iterrows():
-        params = dict(DEFAULT_PARAMS)
-        for k in PARAM_KEYS_ORDER:
-            params[k] = row[k]
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                m = run_backtest(params, oos_df, initial_balance=initial_balance,
-                                 save_events_path=None, verbose=False)
-        except Exception:
-            continue
-        rec = {k: row[k] for k in PARAM_KEYS_ORDER}
-        rec.update({
-            "is_score": row["score"],
-            "is_net_pnl": row["net_pnl"],
-            "oos_net_pnl": m["net_pnl"],
-            "oos_trades": m["num_trades"],
-            "oos_win_rate": m["win_rate"],
-            "oos_max_dd": m["max_drawdown_pct"],
-            "passed": (m["net_pnl"] > OOS_MIN_NET_PNL and m["num_trades"] >= OOS_MIN_TRADES),
-        })
-        oos_results.append(rec)
-
-    oos_df_result = pd.DataFrame(oos_results)
-    oos_df_result.to_csv(oos_csv, index=False)
-    print(f"OOS результатов: {len(oos_df_result)} → {oos_csv}", flush=True)
-
-    passed = oos_df_result[oos_df_result["passed"] == True].sort_values(
-        "oos_net_pnl", ascending=False)
-
-    if passed.empty:
-        tg_send(f"Оптимизатор [{tf}m] завершён. Улучшения не найдено: "
-                f"0 из {len(oos_df_result)} кандидатов прошли OOS-фильтр.")
-        print("\nУлучшения не найдено: ни один кандидат не прошёл OOS.", flush=True)
-        return
-
-    winner = passed.iloc[0]
-    best_params = {k: winner[k] for k in PARAM_KEYS_ORDER}
+    # 4. Финальный бэктест с рассчитанными параметрами
+    print(f"\n[BACKTEST] прогон с рассчитанными параметрами...", flush=True)
+    csv_path = ensure_csv(tf, DAYS_DISTANCE)
+    df = load_df(csv_path, DAYS_DISTANCE)
 
     params = dict(DEFAULT_PARAMS)
-    params.update(best_params)
+    params.update(new_params)
+
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        is_m = run_backtest(params, is_df, initial_balance=initial_balance, verbose=False)
-        oos_m = run_backtest(params, oos_df, initial_balance=initial_balance, verbose=False)
+        metrics = run_backtest(params, df, initial_balance=1000.0, verbose=False)
 
-    cand_path = write_candidate(tf, best_params, is_m, oos_m)
-    print(f"\nКандидат записан: {cand_path}", flush=True)
+    print(f"  net_pnl: {metrics['net_pnl']} USDT", flush=True)
+    print(f"  num_trades: {metrics['num_trades']}", flush=True)
+    print(f"  win_rate: {metrics['win_rate']}", flush=True)
+    print(f"  max_drawdown_pct: {metrics['max_drawdown_pct']}%", flush=True)
 
-    with open(PAIRS_YAML, "r", encoding="utf-8") as f:
-        current_cfg = yaml.safe_load(f) or {}
-    current_btc = current_cfg.get("BTCUSDT", {})
+    # 5. Кандидат
+    cand_path = write_candidate(tf, new_params, metrics)
+    print(f"\nКандидат: {cand_path}", flush=True)
 
-    lines = [f"НОВЫЙ КАНДИДАТ [{tf}m]",
-             f"TF: {tf}m",
-             f"IS: net={is_m['net_pnl']:.2f} trades={is_m['num_trades']} "
-             f"wr={is_m['win_rate']:.3f}",
-             f"OOS: net={oos_m['net_pnl']:.2f} trades={oos_m['num_trades']} "
-             f"wr={oos_m['win_rate']:.3f}",
+    # 6. Отчёт в txt
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
+    report_name = f"{ts}_{tf}m_calc_report.txt"
+    report_path = os.path.join(RESULTS_DIR, report_name)
+    report_text = build_report(tf, old_params, new_params, metrics, durations)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    print(f"Отчёт: {report_path}", flush=True)
+
+    # 7. Загрузка на Яндекс.Диск
+    upload_to_yadisk(report_path, f"grid_bot/reports/{report_name}")
+    upload_to_yadisk(cand_path, f"grid_bot/config/pairs_candidate_{tf}m.yaml")
+
+    # 8. TG-отчёт
+    lines = [f"РАСЧЁТ ЗАВЕРШЁН [{tf}m]",
+             f"net={metrics['net_pnl']:.2f} trades={metrics['num_trades']} "
+             f"wr={metrics['win_rate']:.3f} dd={metrics['max_drawdown_pct']:.2f}%",
              ""]
     for k in PARAM_KEYS_ORDER:
-        old_v = current_btc.get(k, "?")
-        new_v = best_params[k]
-        lines.append(f"{k} = {old_v}/{new_v}")
+        lines.append(f"{k} = {old_params.get(k, '?')}/{new_params[k]}")
     lines.append("")
-    lines.append(f"Файл: {cand_path}")
+    lines.append(f"Файл: pairs_candidate_{tf}m.yaml")
     lines.append("Применить: /apply_candidate")
-
     tg_send("\n".join(lines))
-    print("\n".join(lines), flush=True)
+
+    print(f"\nTotal: {time.time()-t_start:.1f} сек", flush=True)
 
 
 # ============================================================
@@ -457,18 +453,15 @@ def run_optimization(tf: str, workers: int = 1, limit: Optional[int] = None,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tf", type=str, default=None)
-    parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--balance", type=float, default=1000.0)
     args = parser.parse_args()
 
     tf = args.tf if args.tf else read_current_tf()
-    if tf not in GRIDS:
-        print(f"ERROR: unsupported TF '{tf}'. Allowed: {list(GRIDS.keys())}", flush=True)
+    if tf not in ALLOWED_TF:
+        print(f"ERROR: unsupported TF '{tf}'. Allowed: {sorted(ALLOWED_TF)}", flush=True)
         sys.exit(1)
 
     if not acquire_lock():
-        msg = f"Оптимизатор [{tf}m]: предыдущий запуск ещё работает, старт отменён."
+        msg = f"Калькулятор [{tf}m]: предыдущий запуск ещё работает, старт отменён."
         print(msg, flush=True)
         tg_send(msg)
         sys.exit(2)
@@ -481,14 +474,15 @@ def main():
     signal.signal(signal.SIGINT, _cleanup)
 
     try:
-        print(f"=== Оптимизатор === TF: {tf}m, workers={args.workers}, "
-              f"IS: {IS_MONTHS} мес, OOS: {OOS_MONTHS} мес", flush=True)
-        run_optimization(tf, workers=args.workers, limit=args.limit,
-                         initial_balance=args.balance)
+        run_calc(tf)
+    except Exception as e:
+        err = f"Калькулятор [{tf}m] упал: {type(e).__name__}: {e}"
+        print(err, flush=True)
+        print(traceback.format_exc()[:1000], flush=True)
+        tg_send(err)
     finally:
         release_lock()
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     main()
