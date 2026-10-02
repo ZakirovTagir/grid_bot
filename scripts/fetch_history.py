@@ -22,9 +22,9 @@ from pybit.unified_trading import HTTP
 
 # Дефолты для ручного запуска
 DEFAULT_SYMBOL = "BTCUSDT"
-DEFAULT_INTERVAL = "60"          # "1", "5", "15", "30", "60", "240", "D"
-DEFAULT_DAYS_BACK = 180          # 6 месяцев
-DEFAULT_OUTPUT = "data/historical/BTCUSDT_60.csv"
+DEFAULT_INTERVAL = "15"          # "1", "5", "15", "30", "60", "240", "D"
+DEFAULT_DAYS_BACK = 90          # 3 месяца
+DEFAULT_OUTPUT = "data/historical/BTCUSDT_15.csv"
 
 # Длительность интервала в миллисекундах (для правильного шага окна)
 INTERVAL_MS = {
@@ -44,7 +44,7 @@ def _fetch_window(session: HTTP, symbol: str, interval: str,
                   start_ms: int, end_ms: int) -> list:
     """Одна пачка свечей (Bybit отдаёт максимум 1000 за раз)."""
     resp = session.get_kline(
-        category="spot",
+        category="linear",
         symbol=symbol,
         interval=interval,
         start=start_ms,

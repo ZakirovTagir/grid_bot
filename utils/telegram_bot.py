@@ -1,17 +1,6 @@
 """
 utils/telegram_bot.py
 Telegram-бот для управления целями, оптимизатором и остановки.
-
-Команды:
-    /set_target <SYMBOL> <PART> <PRICE>
-    /stop_bot
-    /sync
-    /upload_logs
-    /test_1h        — выбрать TF=1h и запустить расчёт параметров
-    /test_30m       — TF=30m + запуск
-    /test_15m       — TF=15m + запуск
-    /opt_status     — статус калькулятора
-    /apply_candidate — применить pairs_candidate_{tf}m.yaml + загрузить pairs.yaml на Я.Диск
 """
 import os
 import sys
@@ -19,6 +8,7 @@ import logging
 import asyncio
 import subprocess
 import shutil
+import json
 import yaml
 from datetime import datetime
 from telegram import Update
@@ -36,6 +26,7 @@ LOCK_FILE = os.path.join(OPTIMIZATION_DIR, "optimize.lock")
 RESULTS_DIR = os.path.join(OPTIMIZATION_DIR, "results")
 OPTIMIZE_SCRIPT = os.path.join(BASE_DIR, "optimize.py")
 OPTIMIZE_LOG = os.path.join(OPTIMIZATION_DIR, "optimize_launch.log")
+MANUAL_TARGETS_FILE = os.path.join(CONFIG_DIR, "manual_targets.json")
 
 ALLOWED_TF = {"60", "30", "15"}
 TF_LABEL = {"60": "1h", "30": "30m", "15": "15m"}
@@ -51,21 +42,22 @@ class TelegramBot:
         self.sync_callback = sync_callback
         self.upload_logs_callback = upload_logs_callback
         self.reload_params_callback = reload_params_callback
-        self.upload_params_callback = upload_params_callback   # ← загрузка pairs.yaml на Я.Диск
+        self.upload_params_callback = upload_params_callback
 
         self.app = Application.builder().token(token).build()
 
-        # основные
         self.app.add_handler(CommandHandler("set_target", self.set_target))
         self.app.add_handler(CommandHandler("stop_bot", self.stop_bot))
         self.app.add_handler(CommandHandler("sync", self.sync_config))
         self.app.add_handler(CommandHandler("upload_logs", self.upload_logs))
-        # оптимизатор
         self.app.add_handler(CommandHandler("test_1h", self.test_1h))
         self.app.add_handler(CommandHandler("test_30m", self.test_30m))
         self.app.add_handler(CommandHandler("test_15m", self.test_15m))
         self.app.add_handler(CommandHandler("opt_status", self.opt_status))
         self.app.add_handler(CommandHandler("apply_candidate", self.apply_candidate))
+        self.app.add_handler(CommandHandler("target", self.set_manual_target))
+        self.app.add_handler(CommandHandler("clear_target", self.clear_manual_target))
+        self.app.add_handler(CommandHandler("show_target", self.show_manual_target))
 
         self.params = {}
 
@@ -151,7 +143,6 @@ class TelegramBot:
         return files[0]
 
     def _launch_optimize(self, tf: str) -> bool:
-        """Запускает optimize.py в фоне как detached процесс."""
         os.makedirs(OPTIMIZATION_DIR, exist_ok=True)
         log_file = open(OPTIMIZE_LOG, "a")
         try:
@@ -190,7 +181,8 @@ class TelegramBot:
                 return
             self.params[symbol][f"TRAILING_PRICE{part}"] = price
             self.save_params()
-            await update.message.reply_text(f"✅ {symbol} TRAILING_PRICE{part} = {price:.2f}")
+            await update.message.reply_text(
+                f"✅ {symbol} TRAILING_PRICE{part} = {price:.2f}")
         except Exception as e:
             await update.message.reply_text(f"Ошибка: {e}")
 
@@ -219,9 +211,6 @@ class TelegramBot:
             logger.error(f"upload_logs failed: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
-    # ------------------------------------------------------------
-    #  Запуск расчёта
-    # ------------------------------------------------------------
     async def _run_calc(self, update: Update, tf: str):
         pid = self._lock_pid()
         if pid is not None:
@@ -235,8 +224,7 @@ class TelegramBot:
         if not self._launch_optimize(tf):
             await update.message.reply_text(
                 f"❌ Не удалось запустить расчёт для {TF_LABEL[tf]}.\n"
-                f"См. лог: {OPTIMIZE_LOG}"
-            )
+                f"См. лог: {OPTIMIZE_LOG}")
             return
 
         await update.message.reply_text(
@@ -255,9 +243,6 @@ class TelegramBot:
     async def test_15m(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._run_calc(update, "15")
 
-    # ------------------------------------------------------------
-    #  Статус
-    # ------------------------------------------------------------
     async def opt_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         tf = self._read_current_tf()
         pid = self._lock_pid()
@@ -271,24 +256,24 @@ class TelegramBot:
 
         report = self._latest_calc_report(tf)
         if report:
-            mtime = datetime.fromtimestamp(os.path.getmtime(report)).strftime("%Y-%m-%d %H:%M")
+            mtime = datetime.fromtimestamp(
+                os.path.getmtime(report)).strftime("%Y-%m-%d %H:%M")
             lines.append(f"Последний отчёт: {os.path.basename(report)} ({mtime})")
         else:
             lines.append(f"Отчётов для {TF_LABEL[tf]}: нет")
 
         cand = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
         if os.path.exists(cand):
-            mtime = datetime.fromtimestamp(os.path.getmtime(cand)).strftime("%Y-%m-%d %H:%M")
+            mtime = datetime.fromtimestamp(
+                os.path.getmtime(cand)).strftime("%Y-%m-%d %H:%M")
             lines.append(f"Кандидат: pairs_candidate_{tf}m.yaml ({mtime})")
         else:
             lines.append("Кандидат: отсутствует")
 
         await update.message.reply_text("\n".join(lines))
 
-    # ------------------------------------------------------------
-    #  Применение кандидата
-    # ------------------------------------------------------------
-    async def apply_candidate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def apply_candidate(self, update: Update,
+                              context: ContextTypes.DEFAULT_TYPE):
         tf = self._read_current_tf()
         cand_path = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
 
@@ -297,9 +282,9 @@ class TelegramBot:
                 f"❌ Нет кандидата для {TF_LABEL[tf]} ({cand_path})")
             return
 
-        # Бэкап
         backup_path = os.path.join(
-            CONFIG_DIR, f"pairs_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml")
+            CONFIG_DIR,
+            f"pairs_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml")
         try:
             shutil.copy2(YAML_PATH, backup_path)
         except Exception as e:
@@ -312,7 +297,6 @@ class TelegramBot:
             await update.message.reply_text(f"❌ Не удалось применить: {e}")
             return
 
-        # Загрузка pairs.yaml на Яндекс.Диск (новый callback)
         upload_ok = True
         if self.upload_params_callback:
             try:
@@ -321,7 +305,6 @@ class TelegramBot:
                 logger.error(f"upload params failed: {e}")
                 upload_ok = False
 
-        # Reload params в памяти бота
         reload_ok = True
         if self.reload_params_callback:
             try:
@@ -330,7 +313,6 @@ class TelegramBot:
                 logger.error(f"reload failed: {e}")
                 reload_ok = False
 
-        # Показать что применилось
         try:
             with open(YAML_PATH, "r", encoding="utf-8") as f:
                 new_cfg = yaml.safe_load(f) or {}
@@ -357,6 +339,87 @@ class TelegramBot:
             await update.message.reply_text("\n".join(lines))
         except Exception as e:
             await update.message.reply_text(f"⚠️ Применено, но ошибка чтения: {e}")
+
+    # ------------------------------------------------------------
+    #  Ручная цель
+    # ------------------------------------------------------------
+    def _read_manual_targets(self):
+        if not os.path.exists(MANUAL_TARGETS_FILE):
+            return {}
+        try:
+            with open(MANUAL_TARGETS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _write_manual_targets(self, data):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(MANUAL_TARGETS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    async def set_manual_target(self, update: Update,
+                                context: ContextTypes.DEFAULT_TYPE):
+        try:
+            args = context.args
+            if not args:
+                await update.message.reply_text(
+                    "Формат: /target <price>\n"
+                    "Пример: /target 85000\n"
+                    "Сброс: /target 0\n\n"
+                    "Текущий статус: /show_target")
+                return
+            price = float(args[0])
+            targets = self._read_manual_targets()
+            targets['BTCUSDT'] = price
+            self._write_manual_targets(targets)
+
+            if price > 0:
+                await update.message.reply_text(
+                    f"✅ Цель BTCUSDT = {price:.2f}\n"
+                    f"Применится к следующей сделке, обнулится после закрытия.")
+            else:
+                await update.message.reply_text(
+                    "✅ Цель BTCUSDT обнулена.\n"
+                    "Управление целью по формуле (min2 + impulse/2).")
+        except ValueError:
+            await update.message.reply_text("❌ Цена должна быть числом.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    async def clear_manual_target(self, update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE):
+        try:
+            targets = self._read_manual_targets()
+            targets['BTCUSDT'] = 0.0
+            self._write_manual_targets(targets)
+            await update.message.reply_text(
+                "✅ Цель BTCUSDT обнулена. Управление по формуле.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    async def show_manual_target(self, update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+        try:
+            targets = self._read_manual_targets()
+            price = float(targets.get('BTCUSDT', 0.0) or 0.0)
+
+            self.load_params()
+            btc = self.params.get('BTCUSDT', {})
+            min_target_profit = btc.get('MIN_TARGET_PROFIT', '?')
+            target_delay = btc.get('TARGET_BARS_DELAY', '?')
+
+            lines = ["BTCUSDT управление целью:"]
+            if price > 0:
+                lines.append(f"  Ручная цель: {price:.2f} USDT (активна)")
+            else:
+                lines.append("  Ручная цель: не задана")
+                lines.append("  Используется формула: min2 + (max1 - min1)/2")
+            lines.append(f"  MIN_TARGET_PROFIT: {min_target_profit}")
+            lines.append(f"  TARGET_BARS_DELAY: {target_delay}")
+
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
 
     # ------------------------------------------------------------
     #  Уведомления
