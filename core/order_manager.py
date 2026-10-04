@@ -28,11 +28,12 @@ LEVERAGE = 1
 class OrderManager:
     def __init__(self):
         self.session = HTTP(
-            testnet=True,
+            testnet=False,
+            demo=True,
             api_key=os.getenv("BYBIT_API_KEY"),
             api_secret=os.getenv("BYBIT_API_SECRET"),
         )
-        logger.info("OrderManager инициализирован (Bybit Testnet, linear, leverage=1)")
+        logger.info("OrderManager инициализирован (Bybit Demo Trading, linear, leverage=1)")
 
     # ------------------------------------------------------------
     #  Настройка
