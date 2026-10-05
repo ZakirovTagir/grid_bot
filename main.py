@@ -1,21 +1,11 @@
 """
 main.py
-Live-бот на 15m BTCUSDT. Реальные ордера на Bybit Demo Trading (linear perpetual, leverage=1x).
+Live-бот на 15m BTCUSDT. Bybit Demo Trading (linear perpetual, leverage=1x).
 
-Логика:
-1. Свечи читаются с mainnet spot (публичные данные, ключи не нужны).
-2. OrderManager работает на Demo Trading linear (LONG и SHORT).
-3. При сигнале:
-   - считает размер позиции от MAX_LOSS_PER_TRADE
-   - проверяет цель (ручная из manual_targets.json или формула)
-   - открывает позицию по рынку
-   - выставляет стоп-маркет reduceOnly
-4. Каждый цикл:
-   - если позиции нет — ищет сигнал
-   - если позиция есть — проверяет target и следит за закрытием биржей
-5. После закрытия — обнуляет manual target и очищает live_position.json.
-6. Раз в час и через ~90 сек после старта — выгружает debug.log и journalctl
-   на Яндекс.Диск; при старте дополнительно шлёт health-check в Telegram.
+v5:
+- start_ts захватывается в начале main() — journal-снимок включает стартовые сообщения.
+- upload_journal_to_disk: fallback на расширенное окно, если строк мало.
+- upload_logs_to_disk(since_ts): выгружает только свежие строки (delta за прошедший час).
 """
 from __future__ import annotations
 import sys
@@ -38,7 +28,7 @@ import logging
 import os
 import json
 import time
-import subprocess  # [+] PATCH 1: для journalctl
+import subprocess
 import yaml
 import pandas as pd
 from datetime import datetime
@@ -204,29 +194,74 @@ async def get_current_candle(http_session: HTTP, symbol: str):
     return df.iloc[-2]
 
 
-async def upload_logs_to_disk(yadisk: YaDiskSync, local_path: str = LOG_FILE,
+# ---------- Выгрузка логов с фильтром по времени ----------
+def _is_timestamp_line(line: str) -> bool:
+    """YYYY-MM-DD HH:MM:SS — первые 19 символов."""
+    return (len(line) >= 19 and line[4] == '-' and line[7] == '-'
+            and line[10] == ' ')
+
+
+async def upload_logs_to_disk(yadisk: YaDiskSync, since_ts: float,
+                              local_path: str = LOG_FILE,
                               remote_dir: str = "grid_bot/logs/"):
+    """
+    Выгружает только строки debug.log с timestamp >= since_ts.
+    Многострочные продолжения (traceback) идут за своей timestamp-строкой.
+    Возвращает True/False.
+    """
     if not yadisk:
         return False
+    tmp_path = None
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         remote_path = remote_dir + f"debug_{timestamp}.log"
+        tmp_path = os.path.join("config", f"debug_delta_{timestamp}.log")
+
+        cutoff_str = datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+        kept = 0
+        keep = False
+        with open(local_path, "r", encoding="utf-8", errors="replace") as src, \
+             open(tmp_path, "w", encoding="utf-8") as dst:
+            for line in src:
+                if _is_timestamp_line(line):
+                    keep = line[:19] >= cutoff_str
+                # else: продолжение — сохраняем тот же флаг
+                if keep:
+                    dst.write(line)
+                    kept += 1
+
+        if kept == 0:
+            debug_logger.info("Нет новых строк для выгрузки")
+            os.remove(tmp_path)
+            return True
+
         if yadisk.client.exists(remote_path):
             yadisk.client.remove(remote_path)
-        success = yadisk.upload_file(local_path, remote_path)
+        success = yadisk.upload_file(tmp_path, remote_path)
+        os.remove(tmp_path)
+        tmp_path = None
+
         if success:
-            debug_logger.info(f"Лог выгружен: {remote_path}")
+            debug_logger.info(f"Лог выгружен: {remote_path} ({kept} строк)")
         return success
     except Exception as e:
         debug_logger.error(f"Ошибка выгрузки лога: {e}")
         return False
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
-# [+] PATCH 3: выгрузка journalctl на Я.Диск
+# ---------- Выгрузка journalctl ----------
 def upload_journal_to_disk(yadisk, since_ts: int,
                            remote_dir: str = "grid_bot/logs/"):
     """
     Выгружает journalctl для gridbot.service с момента since_ts (unix) на Я.Диск.
+    Если строк мало (< 10) — повторный запрос с окном на 10 минут шире.
     Возвращает remote_path или None.
     """
     if not yadisk:
@@ -246,6 +281,22 @@ def upload_journal_to_disk(yadisk, since_ts: int,
                 check=False, timeout=30,
             )
 
+        # Fallback: если строк мало — расширить окно
+        with open(local_path) as f:
+            line_count = sum(1 for _ in f)
+        if line_count < 10:
+            debug_logger.info(
+                f"journal короткий ({line_count} строк), расширяю окно на 10 мин"
+            )
+            with open(local_path, "w") as f:
+                subprocess.run(
+                    ["journalctl", "-u", "gridbot",
+                     "--since", f"@{since_ts - 600}",
+                     "--no-pager", "-o", "short-iso"],
+                    stdout=f, stderr=subprocess.PIPE,
+                    check=False, timeout=30,
+                )
+
         if yadisk.upload_file(local_path, remote_path):
             debug_logger.info(f"journal выгружен: {remote_path}")
             return remote_path
@@ -262,26 +313,24 @@ def upload_journal_to_disk(yadisk, since_ts: int,
                 pass
 
 
-# [+] PATCH 4: стартовый health-check + снимок журнала
+# ---------- Стартовый снимок + health-check ----------
 async def startup_snapshot_and_healthcheck(order_mgr, tg, yadisk, start_ts):
     """
     Через ~90 сек после старта:
-    - проверяет доступность Bybit / Я.Диск
-    - выгружает journalctl с момента старта на Я.Диск
-    - шлёт одно короткое сообщение в TG
+    - проверяет доступность Bybit / Я.Диск,
+    - выгружает journalctl с момента старта на Я.Диск,
+    - шлёт одно короткое сообщение в TG.
     """
     await asyncio.sleep(90)
 
     lines = []
 
-    # Bybit
     balance = order_mgr.get_wallet_usdt()
     if balance is not None:
         lines.append(f"OK Bybit API (баланс {balance:.2f} USDT)")
     else:
         lines.append("FAIL Bybit API (нет ответа)")
 
-    # Я.Диск
     if yadisk is not None:
         try:
             if yadisk.client.exists("grid_bot/config/pairs.yaml"):
@@ -293,14 +342,12 @@ async def startup_snapshot_and_healthcheck(order_mgr, tg, yadisk, start_ts):
     else:
         lines.append("SKIP Я.Диск (токен не задан)")
 
-    # journalctl → Я.Диск
     remote_path = upload_journal_to_disk(yadisk, start_ts)
     if remote_path:
         lines.append("OK journal (выгружен)")
     else:
         lines.append("FAIL journal (см. debug.log)")
 
-    # Telegram — в самом конце, чтобы был и индикатором, и отчётом
     if tg is not None:
         try:
             text = "Стартовый снимок:\n" + "\n".join(lines)
@@ -322,6 +369,9 @@ def set_running(value: bool):
 
 # ---------- Основная функция ----------
 async def main():
+    # [PATCH] start_ts захватывается первой строкой — до OrderManager, sync, свечей.
+    start_ts = int(time.time())
+
     # 1. Яндекс.Диск и конфиг
     yadisk_token = os.getenv("YADISK_TOKEN")
     yadisk = YaDiskSync(yadisk_token, YAML_PATH,
@@ -372,7 +422,6 @@ async def main():
 
     sym = 'BTCUSDT'
 
-    # Установить плечо 1x один раз
     order_mgr.set_leverage(sym, leverage=1)
 
     state = {
@@ -411,7 +460,6 @@ async def main():
             block_idx_buffer = []
             block_start = i + 1
 
-        # прогреваем check_entry, но сигналы на истории игнорируем
         _ = check_entry(state, i, current_candle, params[sym])
 
     last_processed_idx[sym] = total_initial - 1
@@ -422,8 +470,9 @@ async def main():
     tg = None
     if tg_token:
         async def upload_logs_callback():
+            # Ручной /upload_logs — полный лог от начала времен
             if yadisk:
-                return await upload_logs_to_disk(yadisk)
+                return await upload_logs_to_disk(yadisk, since_ts=0.0)
             return False
 
         tg = TelegramBot(
@@ -442,12 +491,10 @@ async def main():
             f"Live-бот запущен ({CANDLE_INTERVAL}m, BTCUSDT, Demo linear, leverage=1x)"
         )
 
-    # [+] PATCH 5: точка отсчёта для журнала + фоновая задача health-check
-    start_ts = int(time.time())
+    # [PATCH] start_ts уже захвачен выше, здесь только запуск фоновой задачи
     asyncio.create_task(
         startup_snapshot_and_healthcheck(order_mgr, tg, yadisk, start_ts)
     )
-    # [-] PATCH 5 END
 
     last_sync = time.time()
     last_log_upload = time.time()
@@ -455,7 +502,6 @@ async def main():
     # 5. Главный цикл
     while running:
         try:
-            # --- Синхронизация конфига ---
             if yadisk and time.time() - last_sync > 300:
                 if yadisk.sync_if_updated():
                     with open(YAML_PATH, "r", encoding="utf-8") as f:
@@ -467,19 +513,17 @@ async def main():
                     debug_logger.info("Конфиг обновлён с Я.Диска")
                 last_sync = time.time()
 
-            # [+] PATCH 6: раз в час — debug.log + journalctl за прошедший час
+            # [PATCH] выгрузка только новых строк debug.log за прошедший час
             if yadisk and time.time() - last_log_upload > 3600:
-                await upload_logs_to_disk(yadisk)
+                await upload_logs_to_disk(yadisk, since_ts=last_log_upload)
                 upload_journal_to_disk(yadisk, int(time.time()) - 3600)
                 last_log_upload = time.time()
-            # [-] PATCH 6 END
 
             # --- Проверка открытой позиции ---
             live_pos = load_live_position()
             if live_pos is not None:
                 pos_info = order_mgr.get_position(sym)
 
-                # Позиция закрыта биржей (сработал стоп или вручную)
                 if pos_info is None:
                     debug_logger.info("Позиция закрыта биржей (стоп или вручную)")
                     if tg:
@@ -492,7 +536,6 @@ async def main():
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
-                # Проверка цели
                 target = live_pos.get('target_price', 0.0)
                 side = live_pos['side']
                 if target > 0:
@@ -561,16 +604,13 @@ async def main():
                     )
 
                     entry_price = signal['entry_price']
-                    side = signal['type']  # 'LONG' или 'SHORT'
+                    side = signal['type']
 
-                    # [+] PATCH 2: считаем structural_stop_distance из структуры
-                    # LONG: entry − min2, SHORT: max2 − entry
                     if side == 'LONG':
                         structural_stop_distance = entry_price - signal['min2'][1]
                     else:
                         structural_stop_distance = signal['max2'][1] - entry_price
 
-                    # Защита от мусора
                     if structural_stop_distance <= 0:
                         debug_logger.error(
                             f"Некорректная structural_stop_distance="
@@ -581,9 +621,7 @@ async def main():
                             entry_price
                             * params[sym]['MAX_STOP_DISTANCE_PERCENT'] / 100
                         )
-                    # [-] PATCH 2 END
 
-                    # Стоп с учётом cap
                     max_allowed_stop_dist = (
                         entry_price * params[sym]['MAX_STOP_DISTANCE_PERCENT'] / 100
                     )
@@ -601,7 +639,6 @@ async def main():
                         open_side = 'Sell'
                         close_side = 'Buy'
 
-                    # Размер позиции
                     balance_usdt = order_mgr.get_wallet_usdt() or 1000.0
                     qty = params[sym]['MAX_LOSS_PER_TRADE'] / actual_stop_distance
                     position_value = qty * entry_price
@@ -616,7 +653,6 @@ async def main():
                             f"Маленькая позиция {position_value:.2f}, пропуск"
                         )
                     else:
-                        # Целевая цена
                         min1_p = signal['min1'][1]
                         max1_p = signal['max1'][1]
                         if side == 'LONG':
@@ -644,7 +680,6 @@ async def main():
                             elif side == 'SHORT' and (entry_price - structural_target) >= min_profit:
                                 target_price = structural_target
 
-                        # Открываем по рынку
                         order_id = order_mgr.place_market_order(sym, open_side, qty)
                         if order_id:
                             save_live_position({
@@ -678,7 +713,6 @@ async def main():
                                     f"Qty: {qty:.6f}"
                                 )
 
-                    # Сброс состояний обоих искателей
                     state['long']['state'] = 'WAIT_MIN1'
                     state['long']['min1'] = state['long']['max1'] = state['long']['min2'] = None
                     state['short']['state'] = 'WAIT_MAX1'
@@ -690,13 +724,13 @@ async def main():
             debug_logger.error(f"Ошибка в главном цикле: {e}", exc_info=True)
             await asyncio.sleep(CHECK_INTERVAL)
 
-    # Завершение
     debug_logger.info("Бот остановлен")
     if tg:
         await tg.send_notification("Live-бот остановлен.")
         await tg.stop()
     if yadisk:
-        await upload_logs_to_disk(yadisk)
+        # Финальная выгрузка — только новые строки
+        await upload_logs_to_disk(yadisk, since_ts=last_log_upload)
 
 
 if __name__ == "__main__":

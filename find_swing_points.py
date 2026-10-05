@@ -2,14 +2,15 @@
 find_swing_points.py
 Бэктест стратегии на основе свинг-точек.
 
-v3 (calc-версия):
-- MAX_DELTA_EXTREMES переосмыслен как безразмерный множитель k:
-  тело свечи мин2/макс2 не должно превышать k × avg_body свечей в диапазоне
-  от мин1/макс1 до мин2/макс2 включительно.
-- scan_mode: оба искателя работают параллельно и непрерывно.
-- Функции-сборщики статистики для расчёта параметров:
-  collect_block_amplitudes, collect_point_distances,
-  collect_body_ratios, collect_line_gaps.
+v6 (упрощение группы C):
+- Убраны: BREAKEVEN_*, TRAILING_*, двухступенчатая защита.
+- Цель по формуле: 
+    LONG:  target = min2 + (max1 - min1) / 2
+    SHORT: target = max2 - (max1 - min1) / 2
+- Активация цели: target > entry ± MIN_TARGET_PROFIT,
+  и bars_since_entry >= TARGET_BARS_DELAY.
+- Ручная цель через MANUAL_TARGET_PRICE (для live, в бэктесте можно тестировать).
+- Приоритет проверки: сначала стоп, потом цель.
 """
 
 import pandas as pd
@@ -24,31 +25,25 @@ DEFAULT_PARAMS = {
     # --- группа A: структура ---
     'N': 7,
     'MIN_BODY_RATIO': 0.3,
-    'DELTA_PRICE': 259,
+    'DELTA_PRICE': 113.75,
     'MIN_DISTANCE_BARS': 11,
-    'MAX_DELTA_EXTREMES': 4.0,        # теперь безразмерный множитель k
+    'MAX_DELTA_EXTREMES': 4.0,
     # --- группа B: вход ---
-    'ENTRY_TOLERANCE_USD': 4.0,
+    'ENTRY_TOLERANCE_USD': 51.75,
     'MIN_BARS_AFTER_POINT2': 3,
     'MAX_BARS_AFTER_POINT2': 10,
-    # --- группа C: управление позицией ---
+    # --- группа C: управление ---
     'MAX_LOSS_PER_TRADE': 8.0,
     'MAX_STOP_DISTANCE_PERCENT': 2.5,
     'MAX_POSITION_PERCENT': 95.0,
     'MIN_POSITION_USDT': 10.0,
-    'ACTIVATION_PROFIT_USD': 150.0,
-    'BREAKEVEN_BARS_DELAY': 5,
-    'BREAKEVEN_BIG_MOVE_USD': 100.0,
-    'K1_MULT': 1.0,
-    'K1_ADD': 150.0,
-    'K2_MULT': 0.0,
-    'K2_ADD': 0.0,
-    'TRAILING_PRICE1': 0.0,
-    'TRAILING_PRICE2': 0.0,
+    'MIN_TARGET_PROFIT': 200.0,      # USDT: минимальный профит до цели
+    'TARGET_BARS_DELAY': 3,          # баров: задержка активации цели
+    'MANUAL_TARGET_PRICE': 0.0,      # 0 = использовать формулу; >0 = ручная цель
     'TRADING_FEE': 0.001,
 }
 
-INPUT_CSV = "data/historical/BTCUSDT_60.csv"
+INPUT_CSV = "data/historical/BTCUSDT_15.csv"
 OUTPUT_LOG = "swing_points_log.txt"
 
 
@@ -89,7 +84,6 @@ def candle_body(df: pd.DataFrame, idx: int) -> float:
 
 
 def avg_body_between(df: pd.DataFrame, idx_start: int, idx_end: int) -> float:
-    """Среднее тело свечей от idx_start до idx_end включительно."""
     if idx_end < idx_start:
         return 0.0
     bodies = [candle_body(df, i) for i in range(idx_start, idx_end + 1)]
@@ -100,11 +94,6 @@ def avg_body_between(df: pd.DataFrame, idx_start: int, idx_end: int) -> float:
 
 def check_body_spike(df: pd.DataFrame, idx_point1: int, idx_point2: int,
                      k: float) -> bool:
-    """
-    True — если структура ОТБРАСЫВАЕТСЯ (тело точки 2 слишком большое).
-    False — если структура проходит фильтр.
-    k <= 0 → фильтр отключён.
-    """
     if k <= 0:
         return False
     body_p2 = candle_body(df, idx_point2)
@@ -112,6 +101,19 @@ def check_body_spike(df: pd.DataFrame, idx_point1: int, idx_point2: int,
     if avg_body <= 0:
         return False
     return (body_p2 / avg_body) > k
+
+
+def calc_structural_target(side: str, min1_price: float,
+                           max1_price: float, min2_price: float,
+                           max2_price: float) -> float:
+    """Формула цели. Возвращает 0.0 если формула не определена."""
+    impulse = max1_price - min1_price
+    if impulse <= 0:
+        return 0.0
+    if side == 'LONG':
+        return min2_price + impulse / 2.0
+    else:
+        return max2_price - impulse / 2.0
 
 
 # ============================================================
@@ -129,8 +131,6 @@ class LongFinder:
         self.min2_price = None
         self.min2_idx = None
         self.pending_trend = None
-        # debug info
-        self.reject_reason = None
 
     def reset(self):
         self.state = "WAIT_MIN1"
@@ -143,7 +143,6 @@ class LongFinder:
         if self.state == "WAIT_ENTRY":
             return
 
-        N = self.params['N']
         min_body_ratio = self.params['MIN_BODY_RATIO']
         delta_price = self.params['DELTA_PRICE']
         min_distance = self.params['MIN_DISTANCE_BARS']
@@ -168,9 +167,7 @@ class LongFinder:
             if L_price > self.min1_price:
                 distance = L_idx - self.min1_idx
                 if distance >= min_distance and L_idx > self.max1_idx:
-                    # НОВАЯ логика MAX_DELTA_EXTREMES: тело мин2 vs avg_body
                     if check_body_spike(self.df, self.min1_idx, L_idx, max_delta_k):
-                        self.reject_reason = "body_spike"
                         self.reset()
                         return
                     self.min2_price, self.min2_idx = L_price, L_idx
@@ -239,7 +236,6 @@ class ShortFinder:
         self.max2_price = None
         self.max2_idx = None
         self.pending_trend = None
-        self.reject_reason = None
 
     def reset(self):
         self.state = "WAIT_MAX1"
@@ -252,7 +248,6 @@ class ShortFinder:
         if self.state == "WAIT_ENTRY":
             return
 
-        N = self.params['N']
         min_body_ratio = self.params['MIN_BODY_RATIO']
         delta_price = self.params['DELTA_PRICE']
         min_distance = self.params['MIN_DISTANCE_BARS']
@@ -277,9 +272,7 @@ class ShortFinder:
             if H_price < self.max1_price:
                 distance = H_idx - self.max1_idx
                 if distance >= min_distance and H_idx > self.min1_idx:
-                    # НОВАЯ логика: тело макс2 vs avg_body
                     if check_body_spike(self.df, self.max1_idx, H_idx, max_delta_k):
-                        self.reject_reason = "body_spike"
                         self.reset()
                         return
                     self.max2_price, self.max2_idx = H_price, H_idx
@@ -334,57 +327,9 @@ class ShortFinder:
 
 
 # ============================================================
-#  Целевые уровни
-# ============================================================
-def get_active_levels(entry_price, side, structural_stop_distance, params):
-    K1_MULT = params['K1_MULT']
-    K1_ADD = params['K1_ADD']
-    K2_MULT = params['K2_MULT']
-    K2_ADD = params['K2_ADD']
-    TRAILING_PRICE1 = params['TRAILING_PRICE1']
-    TRAILING_PRICE2 = params['TRAILING_PRICE2']
-    ACTIVATION_PROFIT_USD = params['ACTIVATION_PROFIT_USD']
-
-    levels = []
-    parts = [
-        (K1_MULT, K1_ADD, TRAILING_PRICE1),
-        (K2_MULT, K2_ADD, TRAILING_PRICE2),
-    ]
-    cumulative = entry_price
-
-    for mult, add, fixed_price in parts:
-        if fixed_price != 0:
-            target = fixed_price
-            cumulative = target
-            levels.append(target)
-        elif mult != 0 or add != 0:
-            if side == 'LONG':
-                if not levels:
-                    target = entry_price + ACTIVATION_PROFIT_USD + structural_stop_distance * mult + add
-                else:
-                    target = cumulative + structural_stop_distance * mult + add
-            else:
-                if not levels:
-                    target = entry_price - ACTIVATION_PROFIT_USD - structural_stop_distance * mult - add
-                else:
-                    target = cumulative - structural_stop_distance * mult - add
-            cumulative = target
-            levels.append(target)
-        else:
-            break
-    return levels
-
-
-# ============================================================
 #  Scan mode
 # ============================================================
-def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any],
-                   callback=None) -> None:
-    """
-    Прогон без открытия позиций. Оба искателя работают параллельно
-    и непрерывно. При переходе в WAIT_ENTRY — вызвать callback(finder, direction, idx)
-    и сбросить ЭТОТ finder (второй продолжает работать).
-    """
+def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any], callback=None) -> None:
     N = params['N']
     long_finder = LongFinder(df, params)
     short_finder = ShortFinder(df, params)
@@ -394,9 +339,7 @@ def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any],
     block_start = 0
 
     for i in range(total):
-        current_candle = df.iloc[i]
         buffer.append(i)
-
         if len(buffer) == N:
             block = df.iloc[buffer]
             prev_long_state = long_finder.state
@@ -405,7 +348,6 @@ def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any],
             long_finder.process_block(block_start, block)
             short_finder.process_block(block_start, block)
 
-            # Проверяем переход в WAIT_ENTRY
             if prev_long_state != "WAIT_ENTRY" and long_finder.state == "WAIT_ENTRY":
                 if callback is not None:
                     callback("LONG", long_finder)
@@ -421,10 +363,9 @@ def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any],
 
 
 # ============================================================
-#  Сборщики статистики
+#  Сборщики статистики (для оптимизатора, не трогаем)
 # ============================================================
 def collect_block_amplitudes(df: pd.DataFrame, n: int = 7) -> List[float]:
-    """Амплитуды блоков (max(high) - min(low)). Для DELTA_PRICE."""
     amplitudes = []
     total = len(df)
     for start in range(0, total - n + 1, n):
@@ -434,12 +375,7 @@ def collect_block_amplitudes(df: pd.DataFrame, n: int = 7) -> List[float]:
     return amplitudes
 
 
-def collect_point_distances(df: pd.DataFrame,
-                            base_params: Dict[str, Any]) -> List[int]:
-    """
-    Расстояния мин1→мин2 / макс1→макс2 в барах.
-    Все фильтры кроме N и MIN_BODY_RATIO отключены.
-    """
+def collect_point_distances(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[int]:
     params = dict(base_params)
     params['DELTA_PRICE'] = 0
     params['MIN_DISTANCE_BARS'] = 0
@@ -460,12 +396,7 @@ def collect_point_distances(df: pd.DataFrame,
     return distances
 
 
-def collect_body_ratios(df: pd.DataFrame,
-                        base_params: Dict[str, Any]) -> List[float]:
-    """
-    Отношения body(мин2)/avg_body для всех структур.
-    Фильтр по телу отключён. Все остальные фильтры тоже.
-    """
+def collect_body_ratios(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[float]:
     params = dict(base_params)
     params['DELTA_PRICE'] = 0
     params['MIN_DISTANCE_BARS'] = 0
@@ -491,28 +422,18 @@ def collect_body_ratios(df: pd.DataFrame,
     return ratios
 
 
-def collect_line_gaps(df: pd.DataFrame,
-                      base_params: Dict[str, Any]) -> List[float]:
-    """
-    Расстояния (в USDT) от свечи до линии тренда в окне входа.
-    Собираем минимальное из |low - support| и |high - support| (для LONG)
-    и аналогично для SHORT. Если свеча пересекает линию — 0.
-    """
+def collect_line_gaps(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[float]:
     params = dict(base_params)
     params['DELTA_PRICE'] = 0
     params['MIN_DISTANCE_BARS'] = 0
     params['MAX_DELTA_EXTREMES'] = 0
-    # окно входа — берём из base_params как есть
-    # ENTRY_TOLERANCE не отключаем здесь — она не влияет, потому что
-    # мы не проверяем касание, а считаем расстояние до линии вручную.
 
     gaps = []
 
     def cb(direction, finder):
         if direction == "LONG":
             idx_start = finder.min2_idx + 1
-            idx_end = finder.min2_idx + params['MAX_BARS_AFTER_POINT2']
-            idx_end = min(idx_end, len(df) - 1)
+            idx_end = min(finder.min2_idx + params['MAX_BARS_AFTER_POINT2'], len(df) - 1)
             t1, t2 = finder.min1_idx, finder.min2_idx
             p1, p2 = finder.min1_price, finder.min2_price
             for i in range(idx_start, idx_end + 1):
@@ -522,12 +443,10 @@ def collect_line_gaps(df: pd.DataFrame,
                 if low <= line <= high:
                     gaps.append(0.0)
                 else:
-                    d = min(abs(low - line), abs(high - line))
-                    gaps.append(float(d))
+                    gaps.append(float(min(abs(low - line), abs(high - line))))
         else:
             idx_start = finder.max2_idx + 1
-            idx_end = finder.max2_idx + params['MAX_BARS_AFTER_POINT2']
-            idx_end = min(idx_end, len(df) - 1)
+            idx_end = min(finder.max2_idx + params['MAX_BARS_AFTER_POINT2'], len(df) - 1)
             t1, t2 = finder.max1_idx, finder.max2_idx
             p1, p2 = finder.max1_price, finder.max2_price
             for i in range(idx_start, idx_end + 1):
@@ -537,29 +456,29 @@ def collect_line_gaps(df: pd.DataFrame,
                 if low <= line <= high:
                     gaps.append(0.0)
                 else:
-                    d = min(abs(low - line), abs(high - line))
-                    gaps.append(float(d))
+                    gaps.append(float(min(abs(low - line), abs(high - line))))
 
     scan_mode_pass(df, params, callback=cb)
     return gaps
 
 
 # ============================================================
-#  Ядро бэктеста (обычный режим)
+#  Ядро бэктеста
 # ============================================================
 def run_backtest(params: Dict[str, Any],
                  df: pd.DataFrame,
                  initial_balance: float = 1000.0,
                  save_events_path: Optional[str] = None,
                  verbose: bool = False) -> Dict[str, Any]:
+
     N = params['N']
     MAX_LOSS_PER_TRADE = params['MAX_LOSS_PER_TRADE']
     MAX_STOP_DISTANCE_PERCENT = params['MAX_STOP_DISTANCE_PERCENT']
     MAX_POSITION_PERCENT = params['MAX_POSITION_PERCENT']
     MIN_POSITION_USDT = params['MIN_POSITION_USDT']
-    ACTIVATION_PROFIT_USD = params['ACTIVATION_PROFIT_USD']
-    BREAKEVEN_BARS_DELAY = params['BREAKEVEN_BARS_DELAY']
-    BREAKEVEN_BIG_MOVE_USD = params['BREAKEVEN_BIG_MOVE_USD']
+    MIN_TARGET_PROFIT = params['MIN_TARGET_PROFIT']
+    TARGET_BARS_DELAY = params['TARGET_BARS_DELAY']
+    MANUAL_TARGET_PRICE = params.get('MANUAL_TARGET_PRICE', 0.0)
     TRADING_FEE = params['TRADING_FEE']
 
     long_finder = LongFinder(df, params)
@@ -584,145 +503,58 @@ def run_backtest(params: Dict[str, Any],
             entry = position['entry_price']
             qty = position['qty']
             stop_loss = position['stop_loss']
-            breakeven_reached = position['breakeven_reached']
-            has_targets = position['has_targets']
-            parts_active = position['parts_active']
-            parts_qty = position['parts_qty']
+            target_price = position['target_price']
             balance_before_open = position['balance_before']
+            high = current_candle['high']
+            low = current_candle['low']
 
-            if ACTIVATION_PROFIT_USD > 0 and not breakeven_reached:
+            # ---- 1. Проверка стопа (всегда первый приоритет) ----
+            stop_hit = False
+            if side == 'LONG' and low <= stop_loss:
+                stop_hit = True
+            elif side == 'SHORT' and high >= stop_loss:
+                stop_hit = True
+
+            if stop_hit:
+                exit_price = stop_loss
+                commission = qty * exit_price * TRADING_FEE
                 if side == 'LONG':
-                    high = current_candle['high']
-                    normal_trigger = (position['bars_since_entry'] >= BREAKEVEN_BARS_DELAY and
-                                      high >= entry + ACTIVATION_PROFIT_USD)
-                    big_move_trigger = (BREAKEVEN_BIG_MOVE_USD > 0 and
-                                        high >= entry + BREAKEVEN_BIG_MOVE_USD)
-                    if normal_trigger or big_move_trigger:
-                        breakeven_reached = True
-                        position['breakeven_reached'] = True
-                        new_stop = entry + ACTIVATION_PROFIT_USD
-                        if new_stop > stop_loss:
-                            stop_loss = new_stop
-                            position['stop_loss'] = stop_loss
-                            events.append({'type': 'breakeven_activated', 'idx': i,
-                                           'price': stop_loss, 'trend': 'LONG'})
+                    balance += qty * exit_price - commission
                 else:
-                    low = current_candle['low']
-                    normal_trigger = (position['bars_since_entry'] >= BREAKEVEN_BARS_DELAY and
-                                      low <= entry - ACTIVATION_PROFIT_USD)
-                    big_move_trigger = (BREAKEVEN_BIG_MOVE_USD > 0 and
-                                        low <= entry - BREAKEVEN_BIG_MOVE_USD)
-                    if normal_trigger or big_move_trigger:
-                        breakeven_reached = True
-                        position['breakeven_reached'] = True
-                        new_stop = entry - ACTIVATION_PROFIT_USD
-                        if new_stop < stop_loss:
-                            stop_loss = new_stop
-                            position['stop_loss'] = stop_loss
-                            events.append({'type': 'breakeven_activated', 'idx': i,
-                                           'price': stop_loss, 'trend': 'SHORT'})
+                    balance -= qty * exit_price + commission
+                pnl_total = balance - balance_before_open
+                events.append({
+                    'type': 'exit', 'idx': i, 'price': exit_price, 'trend': side,
+                    'details': f"reason: stop_loss, PnL:{pnl_total:.2f} USDT, баланс:{balance:.2f}"
+                })
+                equity_curve.append(balance)
+                position = None
+                long_finder.reset()
+                short_finder.reset()
+                buffer.clear()
+                block_start = i + 1
+                i += 1
+                continue
 
-            if side == 'LONG':
-                high = current_candle['high']
-                low = current_candle['low']
-                if has_targets:
-                    closed_parts = []
-                    for part_idx, target_price in enumerate(parts_active):
-                        if high >= target_price:
-                            part_pnl = (target_price - entry) * parts_qty
-                            commission = target_price * parts_qty * TRADING_FEE
-                            net_pnl = part_pnl - commission
-                            balance += parts_qty * target_price - commission
-                            events.append({
-                                'type': f'exit_part{part_idx + 1}', 'idx': i,
-                                'price': target_price, 'trend': 'LONG',
-                                'details': f"reason: target, PnL:{net_pnl:.2f} USDT, баланс:{balance:.2f}"
-                            })
-                            closed_parts.append(part_idx)
-                    for pidx in sorted(closed_parts, reverse=True):
-                        del parts_active[pidx]
-                    if not parts_active:
-                        pnl_total = balance - balance_before_open
-                        events.append({
-                            'type': 'exit', 'idx': i, 'price': target_price, 'trend': 'LONG',
-                            'details': f"reason: all_targets_closed, PnL:{pnl_total:.2f} USDT, баланс:{balance:.2f}"
-                        })
-                        equity_curve.append(balance)
-                        position = None
-                        long_finder.reset()
-                        short_finder.reset()
-                        buffer.clear()
-                        block_start = i + 1
-                        i += 1
-                        continue
-                if low <= stop_loss:
-                    exit_price = stop_loss
-                    if has_targets:
-                        total_remaining_qty = len(parts_active) * parts_qty
+            # ---- 2. Проверка цели ----
+            if target_price > 0 and position['bars_since_entry'] >= TARGET_BARS_DELAY:
+                target_hit = False
+                if side == 'LONG' and high >= target_price:
+                    target_hit = True
+                elif side == 'SHORT' and low <= target_price:
+                    target_hit = True
+
+                if target_hit:
+                    exit_price = target_price
+                    commission = qty * exit_price * TRADING_FEE
+                    if side == 'LONG':
+                        balance += qty * exit_price - commission
                     else:
-                        total_remaining_qty = qty
-                    reason = 'breakeven_stop' if breakeven_reached else 'stop_loss'
-                    commission = total_remaining_qty * exit_price * TRADING_FEE
-                    balance += total_remaining_qty * exit_price - commission
+                        balance -= qty * exit_price + commission
                     pnl_total = balance - balance_before_open
                     events.append({
-                        'type': 'exit', 'idx': i, 'price': exit_price, 'trend': 'LONG',
-                        'details': f"reason: {reason}, PnL:{pnl_total:.2f} USDT, баланс:{balance:.2f}"
-                    })
-                    equity_curve.append(balance)
-                    position = None
-                    long_finder.reset()
-                    short_finder.reset()
-                    buffer.clear()
-                    block_start = i + 1
-                    i += 1
-                    continue
-            else:
-                high = current_candle['high']
-                low = current_candle['low']
-                if has_targets:
-                    closed_parts = []
-                    for part_idx, target_price in enumerate(parts_active):
-                        if low <= target_price:
-                            part_pnl = (entry - target_price) * parts_qty
-                            commission = target_price * parts_qty * TRADING_FEE
-                            net_pnl = part_pnl - commission
-                            balance -= parts_qty * target_price + commission
-                            events.append({
-                                'type': f'exit_part{part_idx + 1}', 'idx': i,
-                                'price': target_price, 'trend': 'SHORT',
-                                'details': f"reason: target, PnL:{net_pnl:.2f} USDT, баланс:{balance:.2f}"
-                            })
-                            closed_parts.append(part_idx)
-                    for pidx in sorted(closed_parts, reverse=True):
-                        del parts_active[pidx]
-                    if not parts_active:
-                        pnl_total = balance - balance_before_open
-                        events.append({
-                            'type': 'exit', 'idx': i, 'price': target_price, 'trend': 'SHORT',
-                            'details': f"reason: all_targets_closed, PnL:{pnl_total:.2f} USDT, баланс:{balance:.2f}"
-                        })
-                        equity_curve.append(balance)
-                        position = None
-                        long_finder.reset()
-                        short_finder.reset()
-                        buffer.clear()
-                        block_start = i + 1
-                        i += 1
-                        continue
-                if high >= stop_loss:
-                    exit_price = stop_loss
-                    if has_targets:
-                        total_remaining_qty = len(parts_active) * parts_qty
-                    else:
-                        total_remaining_qty = qty
-                    reason = 'breakeven_stop' if breakeven_reached else 'stop_loss'
-                    commission = total_remaining_qty * exit_price * TRADING_FEE
-                    balance -= total_remaining_qty * exit_price + commission
-                    pnl_total = balance - balance_before_open
-                    events.append({
-                        'type': 'exit', 'idx': i, 'price': exit_price, 'trend': 'SHORT',
-                        'details': f"reason: {reason}, PnL:{pnl_total:.2f} USDT, баланс:{balance:.2f}"
+                        'type': 'exit', 'idx': i, 'price': exit_price, 'trend': side,
+                        'details': f"reason: target, PnL:{pnl_total:.2f} USDT, баланс:{balance:.2f}"
                     })
                     equity_curve.append(balance)
                     position = None
@@ -799,23 +631,34 @@ def run_backtest(params: Dict[str, Any],
                         finder.reset()
                         continue
 
+                    # ---- Целевая цена ----
+                    min1_p = signal['min1'][1]
+                    max1_p = signal['max1'][1]
+                    if signal['type'] == 'LONG':
+                        min2_p = signal['min2'][1]
+                        max2_p = 0.0
+                    else:
+                        min2_p = 0.0
+                        max2_p = signal['max2'][1]
+
+                    target_price = 0.0
+                    if MANUAL_TARGET_PRICE > 0:
+                        # ручная цель: валидируем
+                        if signal['type'] == 'LONG' and MANUAL_TARGET_PRICE - entry_price >= MIN_TARGET_PROFIT:
+                            target_price = MANUAL_TARGET_PRICE
+                        elif signal['type'] == 'SHORT' and entry_price - MANUAL_TARGET_PRICE >= MIN_TARGET_PROFIT:
+                            target_price = MANUAL_TARGET_PRICE
+                    else:
+                        # формула
+                        structural_target = calc_structural_target(
+                            signal['type'], min1_p, max1_p, min2_p, max2_p
+                        )
+                        if signal['type'] == 'LONG' and structural_target - entry_price >= MIN_TARGET_PROFIT:
+                            target_price = structural_target
+                        elif signal['type'] == 'SHORT' and entry_price - structural_target >= MIN_TARGET_PROFIT:
+                            target_price = structural_target
+
                     commission_open = position_value * TRADING_FEE
-
-                    target_levels = get_active_levels(entry_price, signal['type'],
-                                                      actual_stop_distance, params)
-                    num_parts = len(target_levels)
-                    has_targets = num_parts > 0
-                    parts_qty = qty / num_parts if has_targets else qty
-
-                    expected_profit = 0.0
-                    if has_targets:
-                        if signal['type'] == 'LONG':
-                            for target in target_levels:
-                                expected_profit += (target - entry_price) * parts_qty
-                        else:
-                            for target in target_levels:
-                                expected_profit += (entry_price - target) * parts_qty
-
                     balance_before = balance
                     if signal['type'] == 'LONG':
                         balance -= position_value + commission_open
@@ -827,10 +670,7 @@ def run_backtest(params: Dict[str, Any],
                         'entry_price': entry_price,
                         'qty': qty,
                         'stop_loss': stop_loss,
-                        'breakeven_reached': False,
-                        'has_targets': has_targets,
-                        'parts_active': target_levels.copy() if has_targets else [],
-                        'parts_qty': parts_qty,
+                        'target_price': target_price,
                         'balance_before': balance_before,
                         'entry_idx': i,
                         'bars_since_entry': 0,
@@ -855,9 +695,8 @@ def run_backtest(params: Dict[str, Any],
 
                     events.append({
                         'type': 'entry', 'idx': i, 'price': entry_price, 'trend': signal['type'],
-                        'details': f"stop_loss:{stop_loss:.2f}, qty:{qty:.6f}, "
-                                   f"pos_value:{position_value:.2f}, parts:{num_parts}, "
-                                   f"expected_profit:{expected_profit:.2f} USDT"
+                        'details': f"stop_loss:{stop_loss:.2f}, target:{target_price:.2f}, "
+                                   f"qty:{qty:.6f}, pos_value:{position_value:.2f}"
                     })
 
                     finder.reset()
@@ -867,27 +706,18 @@ def run_backtest(params: Dict[str, Any],
 
     if position is not None:
         last_price = df.iloc[-1]['close']
+        exit_price = last_price
+        reason = 'end_of_period'
+        qty = position['qty']
+        commission = qty * exit_price * TRADING_FEE
         if position['side'] == 'LONG':
-            exit_price = last_price
-            reason = 'end_of_period'
-            if position['has_targets']:
-                total_qty = len(position['parts_active']) * position['parts_qty']
-            else:
-                total_qty = position['qty']
-            commission = total_qty * exit_price * TRADING_FEE
-            balance += total_qty * exit_price - commission
+            balance += qty * exit_price - commission
         else:
-            exit_price = last_price
-            reason = 'end_of_period'
-            if position['has_targets']:
-                total_qty = len(position['parts_active']) * position['parts_qty']
-            else:
-                total_qty = position['qty']
-            commission = total_qty * exit_price * TRADING_FEE
-            balance -= total_qty * exit_price + commission
+            balance -= qty * exit_price + commission
         pnl_total = balance - position['balance_before']
         events.append({
-            'type': 'exit', 'idx': len(df) - 1, 'price': exit_price, 'trend': position['side'],
+            'type': 'exit', 'idx': len(df) - 1, 'price': exit_price,
+            'trend': position['side'],
             'details': f"reason: {reason}, PnL:{pnl_total:.2f} USDT, баланс:{balance:.2f}"
         })
         equity_curve.append(balance)
@@ -968,9 +798,6 @@ def save_events(events, df, path):
     print(f"Лог сохранён в {path}")
 
 
-# ============================================================
-#  Ручной запуск
-# ============================================================
 def main():
     try:
         df = pd.read_csv(INPUT_CSV)

@@ -1,14 +1,12 @@
 """
 core/order_manager.py
-Модуль взаимодействия с Bybit Testnet API (linear perpetual).
+Модуль взаимодействия с Bybit Demo Trading (linear perpetual).
 Pleczo зафиксировано на 1x. Поддерживает LONG и SHORT.
 
-Логика:
-- Открытие позиции: place_market_order или place_limit_order
-- Стоп-лосс: place_stop_market_order (reduceOnly)
-- Закрытие: close_position (reduceOnly market)
-- Получение позиции: get_position (категория linear)
-- Установка плеча: set_leverage (один раз при старте)
+v3:
+- set_leverage: pybit бросает исключение на retCode 110043 (leverage not modified),
+  а не возвращает его в resp. Теперь в except ловим 110043/"not modified"
+  и считаем это успехом, а не ошибкой.
 """
 from __future__ import annotations
 import os
@@ -50,13 +48,17 @@ class OrderManager:
             if resp.get("retCode") == 0:
                 logger.info(f"Плечо {symbol} = {leverage}x установлено")
                 return True
-            # Уже стоит такое же плечо — не ошибка
             if resp.get("retCode") == 110043:
-                logger.info(f"Плечо {symbol} уже = {leverage}x")
+                logger.info(f"Плечо {symbol} уже = {leverage}x (not modified)")
                 return True
             logger.error(f"Ошибка set_leverage: {resp}")
             return False
         except Exception as e:
+            # pybit бросает исключение при retCode 110043 вместо возврата в resp
+            msg = str(e)
+            if "110043" in msg or "not modified" in msg:
+                logger.info(f"Плечо {symbol} уже = {leverage}x (not modified)")
+                return True
             logger.error(f"Исключение set_leverage: {e}")
             return False
 
