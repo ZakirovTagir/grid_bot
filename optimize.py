@@ -16,6 +16,11 @@ optimize.py — калькулятор параметров стратегии �
 - загружает кандидата и отчёт на Яндекс.Диск;
 - отправляет TG-уведомления (старт и финал);
 - lock-файл для защиты от параллельных запусков.
+
+v2:
+- _to_native_types: numpy-скаляры → Python float/int/bool перед yaml-dump,
+  чтобы в pairs.yaml не попадали теги tag:yaml.org,2002:python/object.
+- write_candidate использует yaml.safe_dump.
 """
 
 import os
@@ -166,7 +171,6 @@ def load_df(csv_path: str, days_back: int) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    # берём последние days_back дней
     end = df["timestamp"].max()
     start = end - pd.Timedelta(days=days_back)
     df = df[df["timestamp"] >= start].reset_index(drop=True)
@@ -204,13 +208,32 @@ def trimmed_median(values: List[float],
     return float(np.median(trimmed))
 
 
+def _to_native_types(obj):
+    """
+    Рекурсивно приводит numpy-скаляры к нативным Python-типам,
+    чтобы yaml.safe_dump мог их сериализовать без тегов
+    tag:yaml.org,2002:python/object.
+    """
+    if isinstance(obj, dict):
+        return {k: _to_native_types(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_native_types(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
+
 # ============================================================
 #  Расчёт параметров
 # ============================================================
 def calc_delta_price(tf: str) -> float:
     """Медиана амплитуд блоков (30 дней) × 0.25."""
     print(f"\n[CALC] DELTA_PRICE — окно {DAYS_DELTA} дней", flush=True)
-    csv_path = ensure_csv(tf, DAYS_DISTANCE)   # берём больше данных, обрежем
+    csv_path = ensure_csv(tf, DAYS_DISTANCE)
     df = load_df(csv_path, DAYS_DELTA)
 
     amplitudes = collect_block_amplitudes(df, n=HARD_N)
@@ -289,8 +312,10 @@ def write_candidate(tf: str, new_params: Dict[str, Any], metrics: Dict) -> str:
         "max_drawdown_pct": metrics["max_drawdown_pct"],
     }
     out_path = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
+    # numpy → нативные типы перед записью
+    cfg = _to_native_types(cfg)
     with open(out_path, "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
     return out_path
 
 
@@ -359,7 +384,6 @@ def run_calc(tf: str):
 
     tg_send(f"Калькулятор параметров запущен: TF={tf}m")
 
-    # Старые параметры
     with open(PAIRS_YAML, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     old_params = dict(cfg.get("BTCUSDT", {}))
@@ -367,22 +391,18 @@ def run_calc(tf: str):
     t_start = time.time()
     durations = {}
 
-    # 1. DELTA_PRICE
     t0 = time.time()
     new_delta = calc_delta_price(tf)
     durations['DELTA_PRICE'] = time.time() - t0
 
-    # 2. MIN_DISTANCE_BARS
     t0 = time.time()
     new_distance = calc_min_distance_bars(tf)
     durations['MIN_DISTANCE_BARS'] = time.time() - t0
 
-    # 3. ENTRY_TOLERANCE_USD
     t0 = time.time()
     new_tolerance = calc_entry_tolerance(tf)
     durations['ENTRY_TOLERANCE_USD'] = time.time() - t0
 
-    # Сборка новых параметров
     new_params = {
         'N': HARD_N,
         'MIN_BODY_RATIO': HARD_MIN_BODY_RATIO,
@@ -398,7 +418,6 @@ def run_calc(tf: str):
     for k in PARAM_KEYS_ORDER:
         print(f"  {k} = {old_params.get(k, '?')} → {new_params[k]}", flush=True)
 
-    # 4. Финальный бэктест с рассчитанными параметрами
     print(f"\n[BACKTEST] прогон с рассчитанными параметрами...", flush=True)
     csv_path = ensure_csv(tf, DAYS_DISTANCE)
     df = load_df(csv_path, DAYS_DISTANCE)
@@ -410,32 +429,31 @@ def run_calc(tf: str):
     with contextlib.redirect_stdout(buf):
         metrics = run_backtest(params, df, initial_balance=1000.0, verbose=False)
 
-    print(f"  net_pnl: {metrics['net_pnl']} USDT", flush=True)
-    print(f"  num_trades: {metrics['num_trades']}", flush=True)
-    print(f"  win_rate: {metrics['win_rate']}", flush=True)
-    print(f"  max_drawdown_pct: {metrics['max_drawdown_pct']}%", flush=True)
+    # метрики могут содержать numpy-типы — для отчёта берём Python-числа
+    metrics_native = _to_native_types(metrics)
 
-    # 5. Кандидат
-    cand_path = write_candidate(tf, new_params, metrics)
+    print(f"  net_pnl: {metrics_native['net_pnl']} USDT", flush=True)
+    print(f"  num_trades: {metrics_native['num_trades']}", flush=True)
+    print(f"  win_rate: {metrics_native['win_rate']}", flush=True)
+    print(f"  max_drawdown_pct: {metrics_native['max_drawdown_pct']}%", flush=True)
+
+    cand_path = write_candidate(tf, new_params, metrics_native)
     print(f"\nКандидат: {cand_path}", flush=True)
 
-    # 6. Отчёт в txt
     ts = datetime.now().strftime("%Y-%m-%d_%H%M")
     report_name = f"{ts}_{tf}m_calc_report.txt"
     report_path = os.path.join(RESULTS_DIR, report_name)
-    report_text = build_report(tf, old_params, new_params, metrics, durations)
+    report_text = build_report(tf, old_params, new_params, metrics_native, durations)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_text)
     print(f"Отчёт: {report_path}", flush=True)
 
-    # 7. Загрузка на Яндекс.Диск
     upload_to_yadisk(report_path, f"grid_bot/reports/{report_name}")
     upload_to_yadisk(cand_path, f"grid_bot/config/pairs_candidate_{tf}m.yaml")
 
-    # 8. TG-отчёт
     lines = [f"РАСЧЁТ ЗАВЕРШЁН [{tf}m]",
-             f"net={metrics['net_pnl']:.2f} trades={metrics['num_trades']} "
-             f"wr={metrics['win_rate']:.3f} dd={metrics['max_drawdown_pct']:.2f}%",
+             f"net={metrics_native['net_pnl']:.2f} trades={metrics_native['num_trades']} "
+             f"wr={metrics_native['win_rate']:.3f} dd={metrics_native['max_drawdown_pct']:.2f}%",
              ""]
     for k in PARAM_KEYS_ORDER:
         lines.append(f"{k} = {old_params.get(k, '?')}/{new_params[k]}")
