@@ -3,15 +3,22 @@ core/order_manager.py
 Модуль взаимодействия с Bybit Demo Trading (linear perpetual).
 Pleczo зафиксировано на 1x. Поддерживает LONG и SHORT.
 
+v4:
+- Добавлено округление qty до qtyStep биржи (floor — вниз, чтобы не превысить риск).
+  Bybit отвечал "Qty invalid (10001)" на 18-значный float.
+- Добавлено округление цены стопа до tickSize: для LONG (Sell) — ceil,
+  для SHORT (Buy) — floor. Стоп всегда ближе к entry, а не дальше.
+- Кеш параметров символа через get_instruments_info.
+- Fallback на дефолты BTCUSDT при ошибке API.
+
 v3:
 - set_leverage: pybit бросает исключение на retCode 110043 (leverage not modified),
-  а не возвращает его в resp. Теперь в except ловим 110043/"not modified"
-  и считаем это успехом, а не ошибкой.
+  а не возвращает его в resp.
 """
 from __future__ import annotations
 import os
+import math
 import logging
-import time
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 
@@ -22,6 +29,14 @@ logger = logging.getLogger(__name__)
 CATEGORY = "linear"
 LEVERAGE = 1
 
+# Дефолтные фильтры для BTCUSDT linear — если API не ответил
+_DEFAULT_INFO = {
+    "qty_step": 0.001,
+    "qty_precision": 3,
+    "tick_size": 0.1,
+    "tick_precision": 1,
+}
+
 
 class OrderManager:
     def __init__(self):
@@ -31,6 +46,7 @@ class OrderManager:
             api_key=os.getenv("BYBIT_API_KEY"),
             api_secret=os.getenv("BYBIT_API_SECRET"),
         )
+        self._symbol_info_cache: dict = {}
         logger.info("OrderManager инициализирован (Bybit Demo Trading, linear, leverage=1)")
 
     # ------------------------------------------------------------
@@ -54,13 +70,95 @@ class OrderManager:
             logger.error(f"Ошибка set_leverage: {resp}")
             return False
         except Exception as e:
-            # pybit бросает исключение при retCode 110043 вместо возврата в resp
             msg = str(e)
             if "110043" in msg or "not modified" in msg:
                 logger.info(f"Плечо {symbol} уже = {leverage}x (not modified)")
                 return True
             logger.error(f"Исключение set_leverage: {e}")
             return False
+
+    # ------------------------------------------------------------
+    #  Параметры символа (qtyStep, tickSize)
+    # ------------------------------------------------------------
+    @staticmethod
+    def _precision_from_str(s: str) -> int:
+        """'0.001' -> 3, '0.1' -> 1, '1' -> 0."""
+        if "." not in s:
+            return 0
+        return len(s.split(".")[1])
+
+    def _get_symbol_info(self, symbol: str) -> dict:
+        """Кеширует qty_step/tick_size по символу."""
+        if symbol in self._symbol_info_cache:
+            return self._symbol_info_cache[symbol]
+
+        info = dict(_DEFAULT_INFO)
+        try:
+            resp = self.session.get_instruments_info(
+                category=CATEGORY, symbol=symbol
+            )
+            if resp.get("retCode") == 0 and resp.get("result", {}).get("list"):
+                item = resp["result"]["list"][0]
+                lot = item.get("lotSizeFilter", {}) or {}
+                pf = item.get("priceFilter", {}) or {}
+
+                qty_step_str = str(lot.get("qtyStep", "0.001"))
+                info["qty_step"] = float(qty_step_str)
+                info["qty_precision"] = self._precision_from_str(qty_step_str)
+
+                tick_str = str(pf.get("tickSize", "0.1"))
+                info["tick_size"] = float(tick_str)
+                info["tick_precision"] = self._precision_from_str(tick_str)
+
+                logger.info(
+                    f"{symbol}: qtyStep={info['qty_step']} "
+                    f"tickSize={info['tick_size']}"
+                )
+            else:
+                logger.warning(
+                    f"get_instruments_info {symbol} пусто, "
+                    f"использую defaults {_DEFAULT_INFO}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Исключение get_instruments_info {symbol}: {e}, "
+                f"использую defaults"
+            )
+
+        self._symbol_info_cache[symbol] = info
+        return info
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        """
+        Округляет qty ВНИЗ до qtyStep биржи.
+        Всегда floor — фактический риск не превысит MAX_LOSS_PER_TRADE.
+        """
+        info = self._get_symbol_info(symbol)
+        step = info["qty_step"]
+        precision = info["qty_precision"]
+        if step <= 0:
+            return qty
+        floored = math.floor(qty / step) * step
+        return round(floored, precision)
+
+    def round_stop_price(self, symbol: str, price: float, side: str) -> float:
+        """
+        Округляет цену стопа до tickSize.
+        side — сторона ордера ('Sell' для LONG, 'Buy' для SHORT).
+        Стоп округляется В СТОРОНУ entry (короче дистанция, меньше риск):
+        - 'Sell' (LONG, стоп ниже entry) → ceil
+        - 'Buy'  (SHORT, стоп выше entry) → floor
+        """
+        info = self._get_symbol_info(symbol)
+        tick = info["tick_size"]
+        precision = info["tick_precision"]
+        if tick <= 0:
+            return price
+        if side == "Sell":
+            rounded = math.ceil(price / tick) * tick
+        else:
+            rounded = math.floor(price / tick) * tick
+        return round(rounded, precision)
 
     # ------------------------------------------------------------
     #  Ордера
@@ -71,7 +169,17 @@ class OrderManager:
         Рыночный ордер.
         side: 'Buy' (открыть LONG или закрыть SHORT), 'Sell' (открыть SHORT или закрыть LONG)
         reduce_only: True для закрытия позиции
+        qty автоматически округляется до qtyStep.
         """
+        raw_qty = qty
+        qty = self.round_qty(symbol, qty)
+        if qty <= 0:
+            logger.error(
+                f"qty={raw_qty} округлилось до 0, ордер не выставлен"
+            )
+            return None
+        if abs(qty - raw_qty) > 1e-12:
+            logger.info(f"qty округлено: {raw_qty:.10f} → {qty}")
         try:
             kwargs = dict(
                 category=CATEGORY,
@@ -99,7 +207,14 @@ class OrderManager:
 
     def place_limit_order(self, symbol: str, side: str, qty: float,
                           price: float, reduce_only: bool = False) -> str | None:
-        """Лимитный ордер."""
+        """Лимитный ордер. qty округляется до qtyStep."""
+        raw_qty = qty
+        qty = self.round_qty(symbol, qty)
+        if qty <= 0:
+            logger.error(
+                f"qty={raw_qty} округлилось до 0, ордер не выставлен"
+            )
+            return None
         try:
             kwargs = dict(
                 category=CATEGORY,
@@ -128,8 +243,22 @@ class OrderManager:
                                 stop_price: float) -> str | None:
         """
         Стоп-маркет (reduceOnly) для защиты открытой позиции.
-        side: 'Sell' для LONG-позиции, 'Buy' для SHORT-позиции
+        side: 'Sell' для LONG-позиции, 'Buy' для SHORT-позиции.
+        qty округляется до qtyStep, цена стопа — до tickSize (в сторону entry).
         """
+        raw_qty = qty
+        qty = self.round_qty(symbol, qty)
+        if qty <= 0:
+            logger.error(
+                f"qty={raw_qty} округлилось до 0, стоп не выставлен"
+            )
+            return None
+
+        raw_price = stop_price
+        stop_price = self.round_stop_price(symbol, stop_price, side)
+        if abs(stop_price - raw_price) > 1e-12:
+            logger.info(f"stop price округлена: {raw_price:.6f} → {stop_price}")
+
         try:
             resp = self.session.place_order(
                 category=CATEGORY,
@@ -145,7 +274,9 @@ class OrderManager:
             )
             if resp.get("retCode") == 0:
                 order_id = resp["result"]["orderId"]
-                logger.info(f"StopMarket {side} {symbol} {qty} @ {stop_price} → {order_id}")
+                logger.info(
+                    f"StopMarket {side} {symbol} {qty} @ {stop_price} → {order_id}"
+                )
                 return order_id
             logger.error(f"Ошибка stop-market: {resp}")
             return None
