@@ -2,11 +2,14 @@
 core/swing_finder.py
 Процедурный поиск свинг-точек с детальным логированием.
 
+v4:
+- [PATCH 15] Лог при отказе кандидата в мин2/макс2 показывает обе проверки:
+  distance >= min_distance и idx > ref_idx. Раньше писалась только дистанция,
+  что путало (писало «дистанция N», хотя N проходило, а валился idx).
+
 v3:
 - MAX_DELTA_EXTREMES теперь безразмерный множитель k.
-  Проверка: body(min2)/avg_body(min1..min2) <= k.
-- process_block принимает buffer_df (полный буфер) для доступа
-  к телам свечей между точками.
+- process_block принимает buffer_df для доступа к телам свечей.
 """
 import logging
 import pandas as pd
@@ -14,9 +17,6 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-#  Вспомогательные
-# ============================================================
 def is_noisy(row, min_body_ratio=0.3):
     high = row['high']
     low = row['low']
@@ -47,7 +47,6 @@ def _candle_body(buffer_df: pd.DataFrame, idx: int) -> float:
 
 
 def _avg_body_between(buffer_df: pd.DataFrame, idx_start: int, idx_end: int) -> float:
-    """Среднее тело свечей от idx_start до idx_end включительно."""
     if idx_end < idx_start:
         return 0.0
     bodies = [_candle_body(buffer_df, i) for i in range(idx_start, idx_end + 1)]
@@ -58,11 +57,6 @@ def _avg_body_between(buffer_df: pd.DataFrame, idx_start: int, idx_end: int) -> 
 
 def _check_body_spike(buffer_df: pd.DataFrame, idx_point1: int, idx_point2: int,
                       k: float) -> bool:
-    """
-    True — если структура ОТБРАСЫВАЕТСЯ (тело точки 2 слишком большое).
-    False — если структура проходит фильтр.
-    k <= 0 → фильтр отключён.
-    """
     if k <= 0:
         return False
     body_p2 = _candle_body(buffer_df, idx_point2)
@@ -79,15 +73,7 @@ def _check_body_spike(buffer_df: pd.DataFrame, idx_point1: int, idx_point2: int,
     return False
 
 
-# ============================================================
-#  process_block
-# ============================================================
 def process_block(state, block_start, block, params, buffer_df=None):
-    """
-    Обработка блока свечей. buffer_df — полный буфер (для расчёта avg_body).
-    Если buffer_df is None — старая логика отключается, фильтр body_spike
-    не применяется (для обратной совместимости).
-    """
     delta_price = params.get('DELTA_PRICE', 30)
     min_distance = params.get('MIN_DISTANCE_BARS', 5)
     max_delta_k = params.get('MAX_DELTA_EXTREMES', 4.0)
@@ -119,9 +105,15 @@ def process_block(state, block_start, block, params, buffer_df=None):
                 logger.info(f"LONG: обновлён макс1 до {H_price} (idx {H_idx})")
             if L_price > state['long']['min1'][1]:
                 distance = L_idx - state['long']['min1'][0]
-                logger.info(f"LONG: кандидат в мин2: L={L_price} (idx {L_idx}), дистанция={distance}, требуется {min_distance}")
-                if distance >= min_distance and L_idx > state['long']['max1'][0]:
-                    # НОВАЯ логика: проверка тела мин2
+                ref_idx = state['long']['max1'][0]
+                ok_dist = distance >= min_distance
+                ok_idx = L_idx > ref_idx
+                logger.info(
+                    f"LONG: кандидат в мин2: L={L_price} (idx {L_idx}), "
+                    f"distance={distance}>={min_distance}? {ok_dist}; "
+                    f"L_idx={L_idx} > max1_idx={ref_idx}? {ok_idx}"
+                )
+                if ok_dist and ok_idx:
                     if buffer_df is not None and _check_body_spike(
                         buffer_df, state['long']['min1'][0], L_idx, max_delta_k
                     ):
@@ -133,7 +125,10 @@ def process_block(state, block_start, block, params, buffer_df=None):
                         state['long']['state'] = 'WAIT_ENTRY'
                         logger.info(f"LONG: переход в WAIT_ENTRY, мин2={L_price} (idx {L_idx})")
                 else:
-                    logger.info(f"LONG: кандидат в мин2 не подходит (дистанция {distance})")
+                    logger.info(
+                        f"LONG: кандидат в мин2 отклонён "
+                        f"(ok_dist={ok_dist}, ok_idx={ok_idx})"
+                    )
             elif L_price < state['long']['min1'][1]:
                 logger.info("LONG: перелом вниз, сброс")
                 state['long']['state'] = 'WAIT_MIN1'
@@ -159,9 +154,15 @@ def process_block(state, block_start, block, params, buffer_df=None):
                 logger.info(f"SHORT: обновлён мин1 до {L_price} (idx {L_idx})")
             if H_price < state['short']['max1'][1]:
                 distance = H_idx - state['short']['max1'][0]
-                logger.info(f"SHORT: кандидат в макс2: H={H_price} (idx {H_idx}), дистанция={distance}, требуется {min_distance}")
-                if distance >= min_distance and H_idx > state['short']['min1'][0]:
-                    # НОВАЯ логика: проверка тела макс2
+                ref_idx = state['short']['min1'][0]
+                ok_dist = distance >= min_distance
+                ok_idx = H_idx > ref_idx
+                logger.info(
+                    f"SHORT: кандидат в макс2: H={H_price} (idx {H_idx}), "
+                    f"distance={distance}>={min_distance}? {ok_dist}; "
+                    f"H_idx={H_idx} > min1_idx={ref_idx}? {ok_idx}"
+                )
+                if ok_dist and ok_idx:
                     if buffer_df is not None and _check_body_spike(
                         buffer_df, state['short']['max1'][0], H_idx, max_delta_k
                     ):
@@ -173,7 +174,10 @@ def process_block(state, block_start, block, params, buffer_df=None):
                         state['short']['state'] = 'WAIT_ENTRY'
                         logger.info(f"SHORT: переход в WAIT_ENTRY, макс2={H_price} (idx {H_idx})")
                 else:
-                    logger.info(f"SHORT: кандидат в макс2 не подходит (дистанция {distance})")
+                    logger.info(
+                        f"SHORT: кандидат в макс2 отклонён "
+                        f"(ok_dist={ok_dist}, ok_idx={ok_idx})"
+                    )
             elif H_price > state['short']['max1'][1]:
                 logger.info("SHORT: перелом вверх, сброс")
                 state['short']['state'] = 'WAIT_MAX1'
@@ -184,9 +188,6 @@ def process_block(state, block_start, block, params, buffer_df=None):
                 state['short']['max1'] = state['short']['min1'] = None
 
 
-# ============================================================
-#  check_entry — без изменений
-# ============================================================
 def check_entry(state, current_idx, current_candle, params):
     min_bars_after = params.get('MIN_BARS_AFTER_POINT2', 3)
     max_bars_after = params.get('MAX_BARS_AFTER_POINT2', 10)

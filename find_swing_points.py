@@ -2,9 +2,15 @@
 find_swing_points.py
 Бэктест стратегии на основе свинг-точек.
 
+v7 (синхронизация с main.py v6+):
+- [PATCH 16/23] MIN_TARGET_PROFIT как floor, не фильтр. Цель НИКОГДА не 0.
+  Если формула даёт меньше floor — подтягиваем до floor.
+  Клэмпинг делается здесь (в бэктесте), в main.py — там же.
+  Логика идентична, чтобы бэктест и live давали одинаковые цели.
+
 v6 (упрощение группы C):
 - Убраны: BREAKEVEN_*, TRAILING_*, двухступенчатая защита.
-- Цель по формуле: 
+- Цель по формуле:
     LONG:  target = min2 + (max1 - min1) / 2
     SHORT: target = max2 - (max1 - min1) / 2
 - Активация цели: target > entry ± MIN_TARGET_PROFIT,
@@ -25,11 +31,11 @@ DEFAULT_PARAMS = {
     # --- группа A: структура ---
     'N': 7,
     'MIN_BODY_RATIO': 0.3,
-    'DELTA_PRICE': 113.75,
-    'MIN_DISTANCE_BARS': 11,
+    'DELTA_PRICE': 116.35,
+    'MIN_DISTANCE_BARS':12,
     'MAX_DELTA_EXTREMES': 4.0,
     # --- группа B: вход ---
-    'ENTRY_TOLERANCE_USD': 51.75,
+    'ENTRY_TOLERANCE_USD': 75.85,
     'MIN_BARS_AFTER_POINT2': 3,
     'MAX_BARS_AFTER_POINT2': 10,
     # --- группа C: управление ---
@@ -37,7 +43,7 @@ DEFAULT_PARAMS = {
     'MAX_STOP_DISTANCE_PERCENT': 2.5,
     'MAX_POSITION_PERCENT': 95.0,
     'MIN_POSITION_USDT': 10.0,
-    'MIN_TARGET_PROFIT': 200.0,      # USDT: минимальный профит до цели
+    'MIN_TARGET_PROFIT': 200.0,      # USDT: минимальный профит до цели (FLOOR)
     'TARGET_BARS_DELAY': 3,          # баров: задержка активации цели
     'MANUAL_TARGET_PRICE': 0.0,      # 0 = использовать формулу; >0 = ручная цель
     'TRADING_FEE': 0.001,
@@ -106,7 +112,10 @@ def check_body_spike(df: pd.DataFrame, idx_point1: int, idx_point2: int,
 def calc_structural_target(side: str, min1_price: float,
                            max1_price: float, min2_price: float,
                            max2_price: float) -> float:
-    """Формула цели. Возвращает 0.0 если формула не определена."""
+    """
+    Формула цели. Возвращает СЫРОЕ значение.
+    Если impulse <= 0 — вернёт 0.0 (клэмпинг делает вызывающий код).
+    """
     impulse = max1_price - min1_price
     if impulse <= 0:
         return 0.0
@@ -632,6 +641,9 @@ def run_backtest(params: Dict[str, Any],
                         continue
 
                     # ---- Целевая цена ----
+                    # [PATCH 16/23] MIN_TARGET_PROFIT как floor, синхронно с main.py.
+                    # Цель НИКОГДА не 0. Если формула даёт меньше floor — подтягиваем.
+                    # Клэмпинг делается здесь, в main.py — там же.
                     min1_p = signal['min1'][1]
                     max1_p = signal['max1'][1]
                     if signal['type'] == 'LONG':
@@ -641,22 +653,21 @@ def run_backtest(params: Dict[str, Any],
                         min2_p = 0.0
                         max2_p = signal['max2'][1]
 
-                    target_price = 0.0
                     if MANUAL_TARGET_PRICE > 0:
-                        # ручная цель: валидируем
-                        if signal['type'] == 'LONG' and MANUAL_TARGET_PRICE - entry_price >= MIN_TARGET_PROFIT:
-                            target_price = MANUAL_TARGET_PRICE
-                        elif signal['type'] == 'SHORT' and entry_price - MANUAL_TARGET_PRICE >= MIN_TARGET_PROFIT:
-                            target_price = MANUAL_TARGET_PRICE
+                        candidate = MANUAL_TARGET_PRICE
                     else:
-                        # формула
-                        structural_target = calc_structural_target(
+                        candidate = calc_structural_target(
                             signal['type'], min1_p, max1_p, min2_p, max2_p
                         )
-                        if signal['type'] == 'LONG' and structural_target - entry_price >= MIN_TARGET_PROFIT:
-                            target_price = structural_target
-                        elif signal['type'] == 'SHORT' and entry_price - structural_target >= MIN_TARGET_PROFIT:
-                            target_price = structural_target
+
+                    if signal['type'] == 'LONG':
+                        floor_price = entry_price + MIN_TARGET_PROFIT
+                        target_price = (max(candidate, floor_price)
+                                        if candidate > 0 else floor_price)
+                    else:
+                        ceiling_price = entry_price - MIN_TARGET_PROFIT
+                        target_price = (min(candidate, ceiling_price)
+                                        if candidate > 0 else ceiling_price)
 
                     commission_open = position_value * TRADING_FEE
                     balance_before = balance

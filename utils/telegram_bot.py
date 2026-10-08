@@ -2,18 +2,16 @@
 utils/telegram_bot.py
 Telegram-бот для управления целями, оптимизатором и остановки.
 
+v3:
+- [PATCH 20] /close_all confirm — закрытие всех позиций по рынку.
+  Без confirm — только предупреждение.
+
 v2:
-- [PATCH 3] /target применяется к ТЕКУЩЕЙ сделке, если позиция открыта.
-  Пишет и в live_position.json (target_price + target_source='manual'),
-  и в manual_targets.json (на случай рестарта).
-  Учитывает floor MIN_TARGET_PROFIT.
-- [PATCH 3] /clear_target сбрасывает цель текущей сделки на floor.
-- [PATCH 7] /close — принудительное рыночное закрытие текущей позиции.
-- [PATCH 7] /position — состояние текущей сделки.
-- [PATCH 8] /mute_position / /unmute_position — вкл/выкл push.
-  Состояние хранится в config/telegram_state.json (переживает рестарт).
-- Методы is_position_push_muted() / reset_position_push_mute() —
-  для использования из main.py (push-цикл и сброс при закрытии).
+- [PATCH 3] /target применяется к ТЕКУЩЕЙ сделке.
+- [PATCH 17] /close — рыночное закрытие.
+- [PATCH 19] /show_target — показывает к текущей или следующей.
+- [PATCH 27] /position.
+- [PATCH 29/30] /mute_position + /unmute_position.
 """
 import os
 import sys
@@ -48,21 +46,20 @@ TF_LABEL = {"60": "1h", "30": "30m", "15": "15m"}
 
 
 class TelegramBot:
-    def __init__(self, token: str, order_mgr=None, stop_callback=None,
-                 sync_callback=None, upload_logs_callback=None,
-                 reload_params_callback=None, upload_params_callback=None):
+    def __init__(self, token: str, stop_callback=None, sync_callback=None,
+                 upload_logs_callback=None, reload_params_callback=None,
+                 upload_params_callback=None, order_mgr=None):
         self.token = token
         self.chat_id = int(os.getenv("TELEGRAM_CHAT_ID", 0))
-        self.order_mgr = order_mgr
         self.stop_callback = stop_callback
         self.sync_callback = sync_callback
         self.upload_logs_callback = upload_logs_callback
         self.reload_params_callback = reload_params_callback
         self.upload_params_callback = upload_params_callback
+        self.order_mgr = order_mgr
 
         self.app = Application.builder().token(token).build()
 
-        # --- Оптимизатор / конфиг ---
         self.app.add_handler(CommandHandler("set_target", self.set_target))
         self.app.add_handler(CommandHandler("stop_bot", self.stop_bot))
         self.app.add_handler(CommandHandler("sync", self.sync_config))
@@ -72,17 +69,12 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("test_15m", self.test_15m))
         self.app.add_handler(CommandHandler("opt_status", self.opt_status))
         self.app.add_handler(CommandHandler("apply_candidate", self.apply_candidate))
-
-        # --- Цель ---
         self.app.add_handler(CommandHandler("target", self.set_manual_target))
         self.app.add_handler(CommandHandler("clear_target", self.clear_manual_target))
         self.app.add_handler(CommandHandler("show_target", self.show_manual_target))
-
-        # --- Позиция (PATCH 7) ---
         self.app.add_handler(CommandHandler("close", self.close_position_cmd))
-        self.app.add_handler(CommandHandler("position", self.position_status))
-
-        # --- Push (PATCH 8) ---
+        self.app.add_handler(CommandHandler("close_all", self.close_all_positions_cmd))
+        self.app.add_handler(CommandHandler("position", self.show_position))
         self.app.add_handler(CommandHandler("mute_position", self.mute_position))
         self.app.add_handler(CommandHandler("unmute_position", self.unmute_position))
 
@@ -135,6 +127,41 @@ class TelegramBot:
         with open(YAML_PATH, "w", encoding="utf-8") as f:
             yaml.dump(self.params, f, allow_unicode=True, sort_keys=False)
 
+    @staticmethod
+    def _read_json(path, default=None):
+        if not os.path.exists(path):
+            return default
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _write_json(path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def _read_live_position(self):
+        return self._read_json(LIVE_POSITION_FILE, None)
+
+    def _write_live_position(self, data):
+        self._write_json(LIVE_POSITION_FILE, data)
+
+    def _clear_live_position(self):
+        if os.path.exists(LIVE_POSITION_FILE):
+            try:
+                os.remove(LIVE_POSITION_FILE)
+            except Exception as e:
+                logger.error(f"clear live_position failed: {e}")
+
+    def _read_state(self):
+        return self._read_json(TELEGRAM_STATE_FILE, {}) or {}
+
+    def _write_state(self, data):
+        self._write_json(TELEGRAM_STATE_FILE, data)
+
     def _read_current_tf(self) -> str:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r") as f:
@@ -185,72 +212,6 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"launch optimize failed: {e}")
             return False
-
-    # ------------------------------------------------------------
-    #  Файловые хелперы: live_position, manual_targets, telegram_state
-    # ------------------------------------------------------------
-    def _read_live_position(self):
-        if not os.path.exists(LIVE_POSITION_FILE):
-            return None
-        try:
-            with open(LIVE_POSITION_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if data else None
-        except Exception:
-            return None
-
-    def _write_live_position(self, pos):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(LIVE_POSITION_FILE, "w", encoding="utf-8") as f:
-            json.dump(pos, f, indent=2)
-
-    def _clear_live_position(self):
-        if os.path.exists(LIVE_POSITION_FILE):
-            try:
-                os.remove(LIVE_POSITION_FILE)
-            except Exception:
-                pass
-
-    def _read_manual_targets(self):
-        if not os.path.exists(MANUAL_TARGETS_FILE):
-            return {}
-        try:
-            with open(MANUAL_TARGETS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def _write_manual_targets(self, data):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(MANUAL_TARGETS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
-    def _read_telegram_state(self):
-        if not os.path.exists(TELEGRAM_STATE_FILE):
-            return {"position_push_muted": False}
-        try:
-            with open(TELEGRAM_STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if "position_push_muted" not in data:
-                data["position_push_muted"] = False
-            return data
-        except Exception:
-            return {"position_push_muted": False}
-
-    def _write_telegram_state(self, data):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(TELEGRAM_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
-    def is_position_push_muted(self) -> bool:
-        """Читается из main.py в push-цикле."""
-        return bool(self._read_telegram_state().get("position_push_muted", False))
-
-    def reset_position_push_mute(self) -> None:
-        """Вызывается из main.py при закрытии позиции."""
-        state = self._read_telegram_state()
-        state["position_push_muted"] = False
-        self._write_telegram_state(state)
 
     # ------------------------------------------------------------
     #  Оригинальные команды
@@ -311,15 +272,12 @@ class TelegramBot:
                 f"⚠️ Расчёт уже идёт (PID {pid}).\nПроверь: /opt_status"
             )
             return
-
         self._write_current_tf(tf)
-
         if not self._launch_optimize(tf):
             await update.message.reply_text(
                 f"❌ Не удалось запустить расчёт для {TF_LABEL[tf]}.\n"
                 f"См. лог: {OPTIMIZE_LOG}")
             return
-
         await update.message.reply_text(
             f"✅ Расчёт запущен: TF={TF_LABEL[tf]}\n\n"
             f"Время: ~30 секунд\n"
@@ -339,14 +297,11 @@ class TelegramBot:
     async def opt_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         tf = self._read_current_tf()
         pid = self._lock_pid()
-
         lines = [f"Текущий TF: {TF_LABEL[tf]} ({tf})"]
-
         if pid is not None:
             lines.append(f"Статус: ⏳ расчёт идёт (PID {pid})")
         else:
             lines.append("Статус: свободен")
-
         report = self._latest_calc_report(tf)
         if report:
             mtime = datetime.fromtimestamp(
@@ -354,7 +309,6 @@ class TelegramBot:
             lines.append(f"Последний отчёт: {os.path.basename(report)} ({mtime})")
         else:
             lines.append(f"Отчётов для {TF_LABEL[tf]}: нет")
-
         cand = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
         if os.path.exists(cand):
             mtime = datetime.fromtimestamp(
@@ -362,19 +316,16 @@ class TelegramBot:
             lines.append(f"Кандидат: pairs_candidate_{tf}m.yaml ({mtime})")
         else:
             lines.append("Кандидат: отсутствует")
-
         await update.message.reply_text("\n".join(lines))
 
     async def apply_candidate(self, update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
         tf = self._read_current_tf()
         cand_path = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
-
         if not os.path.exists(cand_path):
             await update.message.reply_text(
                 f"❌ Нет кандидата для {TF_LABEL[tf]} ({cand_path})")
             return
-
         backup_path = os.path.join(
             CONFIG_DIR,
             f"pairs_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml")
@@ -383,13 +334,11 @@ class TelegramBot:
         except Exception as e:
             await update.message.reply_text(f"❌ Бэкап не создан: {e}")
             return
-
         try:
             shutil.copy2(cand_path, YAML_PATH)
         except Exception as e:
             await update.message.reply_text(f"❌ Не удалось применить: {e}")
             return
-
         upload_ok = True
         if self.upload_params_callback:
             try:
@@ -397,7 +346,6 @@ class TelegramBot:
             except Exception as e:
                 logger.error(f"upload params failed: {e}")
                 upload_ok = False
-
         reload_ok = True
         if self.reload_params_callback:
             try:
@@ -405,7 +353,6 @@ class TelegramBot:
             except Exception as e:
                 logger.error(f"reload failed: {e}")
                 reload_ok = False
-
         try:
             with open(YAML_PATH, "r", encoding="utf-8") as f:
                 new_cfg = yaml.safe_load(f) or {}
@@ -434,8 +381,22 @@ class TelegramBot:
             await update.message.reply_text(f"⚠️ Применено, но ошибка чтения: {e}")
 
     # ------------------------------------------------------------
-    #  Ручная цель (PATCH 3)
+    #  Ручная цель
     # ------------------------------------------------------------
+    def _read_manual_targets(self):
+        return self._read_json(MANUAL_TARGETS_FILE, {}) or {}
+
+    def _write_manual_targets(self, data):
+        self._write_json(MANUAL_TARGETS_FILE, data)
+
+    def _get_min_profit(self, symbol="BTCUSDT") -> float:
+        self.load_params()
+        btc = self.params.get(symbol, {})
+        try:
+            return float(btc.get("MIN_TARGET_PROFIT", 200.0))
+        except Exception:
+            return 200.0
+
     async def set_manual_target(self, update: Update,
                                 context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -443,307 +404,276 @@ class TelegramBot:
             if not args:
                 await update.message.reply_text(
                     "Формат: /target <price>\n"
-                    "Пример: /target 83000\n"
+                    "Пример: /target 85000\n"
                     "Сброс: /target 0\n\n"
-                    "Если позиция открыта — цель применится к текущей сделке.\n"
-                    "Иначе — сохранится для следующей.\n"
                     "Текущий статус: /show_target")
                 return
-            price = float(args[0])
+            requested = float(args[0])
 
-            # всегда пишем в manual_targets.json
-            targets = self._read_manual_targets()
-            targets['BTCUSDT'] = price
-            self._write_manual_targets(targets)
-
-            if price == 0:
-                # сброс — работает так же, как /clear_target
-                await self.clear_manual_target(update, context)
+            if requested <= 0:
+                self._write_manual_targets({"BTCUSDT": 0.0})
+                live_pos = self._read_live_position()
+                if live_pos is not None:
+                    live_pos["target_price"] = 0.0
+                    live_pos["target_source"] = "formula"
+                    self._write_live_position(live_pos)
+                await update.message.reply_text(
+                    "✅ Ручная цель обнулена.\n"
+                    "Управление целью по формуле (MIN_TARGET_PROFIT как floor).")
                 return
 
+            min_profit = self._get_min_profit("BTCUSDT")
             live_pos = self._read_live_position()
 
-            if live_pos is None:
+            if live_pos is not None:
+                side = live_pos.get("side")
+                entry = float(live_pos.get("entry_price", 0))
+                applied = requested
+                clamped_msg = ""
+                if side == "LONG":
+                    floor_price = entry + min_profit
+                    if requested < floor_price:
+                        applied = floor_price
+                        clamped_msg = (
+                            f"\n⚠️ Цель была ближе MIN_TARGET_PROFIT, "
+                            f"подтянута до {applied:.2f} (floor)."
+                        )
+                else:
+                    ceiling_price = entry - min_profit
+                    if requested > ceiling_price:
+                        applied = ceiling_price
+                        clamped_msg = (
+                            f"\n⚠️ Цель была ближе MIN_TARGET_PROFIT, "
+                            f"подтянута до {applied:.2f} (floor)."
+                        )
+                live_pos["target_price"] = applied
+                live_pos["target_source"] = "manual"
+                self._write_live_position(live_pos)
+                self._write_manual_targets({"BTCUSDT": applied})
                 await update.message.reply_text(
-                    f"✅ Цель BTCUSDT = {price:.2f} сохранена для следующей сделки.\n"
-                    f"Обнулится после её закрытия."
-                )
-                return
-
-            # применяем к текущей
-            self.load_params()
-            btc = self.params.get('BTCUSDT', {})
-            min_profit = float(btc.get('MIN_TARGET_PROFIT', 200.0))
-
-            entry = float(live_pos.get('entry_price', 0.0))
-            side = live_pos.get('side')
-
-            if side == 'LONG':
-                floor_price = entry + min_profit
-                actual = max(price, floor_price)
-                was_clamped = actual > price + 1e-6
-            else:  # SHORT
-                ceiling_price = entry - min_profit
-                actual = min(price, ceiling_price)
-                was_clamped = actual < price - 1e-6
-
-            live_pos['target_price'] = actual
-            live_pos['target_source'] = 'manual'
-            self._write_live_position(live_pos)
-
-            if was_clamped:
-                await update.message.reply_text(
-                    f"✅ Цель применена к текущей {side}\n"
-                    f"Текущая цена: {actual:.2f}\n"
-                    f"⚠️ Запрошенная {price:.2f} не прошла floor "
-                    f"MIN_TARGET_PROFIT={min_profit:.2f}, подтянута."
-                )
+                    f"✅ Цель применена к ТЕКУЩЕЙ {side} BTCUSDT: {applied:.2f}"
+                    f"{clamped_msg}")
             else:
+                self._write_manual_targets({"BTCUSDT": requested})
                 await update.message.reply_text(
-                    f"✅ Цель {actual:.2f} применена к текущей {side} сделке."
-                )
+                    f"✅ Цель BTCUSDT = {requested:.2f} сохранена.\n"
+                    f"Применится к следующей сделке.\n"
+                    f"MIN_TARGET_PROFIT = {min_profit} (floor).")
         except ValueError:
             await update.message.reply_text("❌ Цена должна быть числом.")
         except Exception as e:
-            logger.error(f"set_manual_target failed: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     async def clear_manual_target(self, update: Update,
                                   context: ContextTypes.DEFAULT_TYPE):
         try:
-            # 1) чистим manual_targets.json
-            targets = self._read_manual_targets()
-            targets['BTCUSDT'] = 0.0
-            self._write_manual_targets(targets)
-
-            # 2) если позиция открыта — сбрасываем её цель на floor
+            self._write_manual_targets({"BTCUSDT": 0.0})
             live_pos = self._read_live_position()
-            if live_pos is None:
+            if live_pos is not None:
+                live_pos["target_price"] = 0.0
+                live_pos["target_source"] = "formula"
+                self._write_live_position(live_pos)
                 await update.message.reply_text(
-                    "✅ Ручная цель сброшена.\n"
-                    "Следующая сделка — по формуле."
-                )
-                return
-
-            self.load_params()
-            btc = self.params.get('BTCUSDT', {})
-            min_profit = float(btc.get('MIN_TARGET_PROFIT', 200.0))
-
-            entry = float(live_pos.get('entry_price', 0.0))
-            side = live_pos.get('side')
-
-            if side == 'LONG':
-                new_target = entry + min_profit
+                    "✅ Ручная цель сброшена. Текущая сделка пойдёт по формуле.")
             else:
-                new_target = entry - min_profit
-
-            live_pos['target_price'] = new_target
-            live_pos['target_source'] = 'floor'
-            self._write_live_position(live_pos)
-
-            await update.message.reply_text(
-                f"✅ Ручная цель сброшена.\n"
-                f"Текущая {side} переведена на цель {new_target:.2f} "
-                f"(floor MIN_TARGET_PROFIT={min_profit:.2f})."
-            )
+                await update.message.reply_text(
+                    "✅ Ручная цель сброшена. Управление по формуле.")
         except Exception as e:
-            logger.error(f"clear_manual_target failed: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     async def show_manual_target(self, update: Update,
                                  context: ContextTypes.DEFAULT_TYPE):
         try:
             targets = self._read_manual_targets()
-            manual_price = float(targets.get('BTCUSDT', 0.0) or 0.0)
+            manual_price = float(targets.get("BTCUSDT", 0.0) or 0.0)
+
+            self.load_params()
+            btc = self.params.get("BTCUSDT", {})
+            min_target_profit = btc.get("MIN_TARGET_PROFIT", "?")
+            target_delay = btc.get("TARGET_BARS_DELAY", "?")
 
             live_pos = self._read_live_position()
 
-            self.load_params()
-            btc = self.params.get('BTCUSDT', {})
-            min_target_profit = btc.get('MIN_TARGET_PROFIT', '?')
-            target_delay = btc.get('TARGET_BARS_DELAY', '?')
-
             lines = ["BTCUSDT управление целью:"]
-
             if live_pos is not None:
-                side = live_pos.get('side', '?')
-                entry = float(live_pos.get('entry_price', 0.0))
-                actual_target = float(live_pos.get('target_price', 0.0) or 0.0)
-                source = live_pos.get('target_source', '?')
-                lines.append(f"  Позиция: {side} @ {entry:.2f}")
-                if actual_target > 0:
-                    lines.append(
-                        f"  Цель текущей сделки: {actual_target:.2f} ({source})"
-                    )
-                else:
-                    lines.append("  Цель текущей сделки: не задана")
-                if manual_price > 0:
-                    lines.append(f"  Ручная цель (файл): {manual_price:.2f}")
+                side = live_pos.get("side", "?")
+                entry = float(live_pos.get("entry_price", 0))
+                target = float(live_pos.get("target_price", 0))
+                src = live_pos.get("target_source", "?")
+                lines.append(f"  Сделка открыта: {side} @ {entry:.2f}")
+                lines.append(f"  Цель текущей сделки: {target:.2f} ({src})")
+                if manual_price > 0 and src == "manual":
+                    lines.append(f"  Ручная цель (активна): {manual_price:.2f}")
                 else:
                     lines.append("  Ручная цель: не задана")
             else:
                 lines.append("  Позиция: нет")
                 if manual_price > 0:
                     lines.append(
-                        f"  Ручная цель (на следующую): {manual_price:.2f}"
-                    )
+                        f"  Ручная цель (на следующую): {manual_price:.2f}")
                 else:
                     lines.append("  Ручная цель: не задана")
-                    lines.append("  Формула: min2 + (max1 - min1)/2")
-
-            lines.append(f"  MIN_TARGET_PROFIT: {min_target_profit}")
+            lines.append(f"  MIN_TARGET_PROFIT: {min_target_profit} (floor)")
             lines.append(f"  TARGET_BARS_DELAY: {target_delay}")
 
             await update.message.reply_text("\n".join(lines))
         except Exception as e:
-            logger.error(f"show_manual_target failed: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     # ------------------------------------------------------------
-    #  Позиция (PATCH 7)
+    #  Управление позицией
     # ------------------------------------------------------------
     async def close_position_cmd(self, update: Update,
                                  context: ContextTypes.DEFAULT_TYPE):
+        if self.order_mgr is None:
+            await update.message.reply_text("❌ order_mgr не подключён.")
+            return
+        live_pos = self._read_live_position()
+        if live_pos is None:
+            await update.message.reply_text("Нет открытой позиции.")
+            return
+        await update.message.reply_text("Закрываю позицию по рынку...")
         try:
-            if self.order_mgr is None:
-                await update.message.reply_text(
-                    "❌ order_mgr не передан в TelegramBot."
-                )
-                return
-
-            live_pos = self._read_live_position()
-            if live_pos is None:
-                await update.message.reply_text("Нет открытой позиции.")
-                return
-
-            sym = live_pos.get('symbol', 'BTCUSDT')
-
-            # 1) отменяем висящие ордера (в т.ч. стоп)
-            try:
-                self.order_mgr.cancel_all_orders(sym)
-            except Exception as e:
-                logger.warning(f"cancel_all_orders {sym} failed: {e}")
-
-            # 2) закрываем по рынку
-            order_id = self.order_mgr.close_position(sym)
-
+            order_id = self.order_mgr.close_position("BTCUSDT")
             if order_id:
-                # 3) чистим состояние
                 self._clear_live_position()
-                targets = self._read_manual_targets()
-                targets['BTCUSDT'] = 0.0
-                self._write_manual_targets(targets)
-                self.reset_position_push_mute()
-
+                self._write_manual_targets({"BTCUSDT": 0.0})
                 await update.message.reply_text(
-                    f"✅ {sym} закрыта по рынку.\n"
-                    f"Order: {order_id}"
-                )
+                    f"✅ Позиция закрыта по рынку.\norder_id: {order_id}")
             else:
                 await update.message.reply_text(
-                    f"❌ Не удалось закрыть {sym}.\n"
-                    f"См. debug.log."
-                )
+                    "❌ Не удалось закрыть позицию (см. debug.log).")
         except Exception as e:
-            logger.error(f"close_position_cmd failed: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
-    async def position_status(self, update: Update,
-                              context: ContextTypes.DEFAULT_TYPE):
+    async def close_all_positions_cmd(self, update: Update,
+                                      context: ContextTypes.DEFAULT_TYPE):
+        """[PATCH 20] /close_all confirm — закрыть все позиции по рынку."""
+        args = context.args or []
+        if not args or args[0].lower() != "confirm":
+            await update.message.reply_text(
+                "⚠️ Формат: /close_all confirm\n\n"
+                "Закроет ВСЕ открытые позиции по рынку.\n"
+                "Действие необратимо. Добавь 'confirm' для подтверждения.")
+            return
+        if self.order_mgr is None:
+            await update.message.reply_text("❌ order_mgr не подключён.")
+            return
+        await update.message.reply_text("Закрываю все позиции по рынку...")
+        try:
+            results = self.order_mgr.close_all_positions()
+            self._clear_live_position()
+            self._write_manual_targets({"BTCUSDT": 0.0})
+            if not results:
+                await update.message.reply_text("Открытых позиций нет.")
+                return
+            lines = [f"✅ Обработано позиций: {len(results)}"]
+            for r in results:
+                ok = "✅" if r.get("success") else "❌"
+                lines.append(
+                    f"  {ok} {r.get('symbol')} {r.get('side')} "
+                    f"size={r.get('size')}"
+                )
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    async def show_position(self, update: Update,
+                            context: ContextTypes.DEFAULT_TYPE):
         try:
             live_pos = self._read_live_position()
-
             if live_pos is None:
-                muted = self.is_position_push_muted()
-                lines = ["Нет открытой позиции."]
-                lines.append(f"Push: {'выключен' if muted else 'включен'}")
-                await update.message.reply_text("\n".join(lines))
+                targets = self._read_manual_targets()
+                mp = float(targets.get("BTCUSDT", 0.0) or 0.0)
+                if mp > 0:
+                    await update.message.reply_text(
+                        f"Нет открытых позиций.\n"
+                        f"Ручная цель на следующую сделку: {mp:.2f}")
+                else:
+                    await update.message.reply_text(
+                        "Нет открытых позиций.\n"
+                        "Ручная цель на следующую сделку: не задана")
                 return
 
-            if self.order_mgr is None:
+            side = live_pos.get("side", "?")
+            entry = float(live_pos.get("entry_price", 0))
+            qty = float(live_pos.get("qty", 0))
+            stop = float(live_pos.get("stop_loss", 0))
+            target = float(live_pos.get("target_price", 0))
+            src = live_pos.get("target_source", "?")
+            stop_ok = live_pos.get("stop_ok", None)
+            opened_at = live_pos.get("opened_at", "?")
+
+            last_price = None
+            pnl = None
+            if self.order_mgr is not None:
+                last_price = self.order_mgr.get_last_price("BTCUSDT")
+                pos_info = self.order_mgr.get_position("BTCUSDT")
+                if pos_info is not None:
+                    pnl = pos_info.get("unrealized_pnl")
+
+            if last_price is None:
                 await update.message.reply_text(
-                    "❌ order_mgr не передан в TelegramBot."
-                )
+                    f"Не удалось получить цену с биржи.\n"
+                    f"Локально: {side} {qty} @ {entry:.2f}\n"
+                    f"Стоп: {stop:.2f}\nЦель: {target:.2f} ({src})")
                 return
 
-            sym = live_pos.get('symbol', 'BTCUSDT')
-            side = live_pos.get('side', '?')
-            entry = float(live_pos.get('entry_price', 0.0))
-            qty = float(live_pos.get('qty', 0.0))
-            stop = float(live_pos.get('stop_loss', 0.0))
-            target = float(live_pos.get('target_price', 0.0) or 0.0)
-            target_source = live_pos.get('target_source', '?')
-            stop_ok = live_pos.get('stop_ok', None)
-            opened_at = live_pos.get('opened_at', '?')
-
-            last_price = self.order_mgr.get_last_price(sym)
-
-            lines = [f"📍 {sym} {side} {qty:.6f}"]
-            lines.append(f"Entry:  {entry:.2f}")
-
-            if last_price is not None:
-                lines.append(f"Сейчас: {last_price:.2f}")
-                if side == 'LONG':
+            if pnl is None:
+                if side == "LONG":
                     pnl = (last_price - entry) * qty
                 else:
                     pnl = (entry - last_price) * qty
-                lines.append(f"PnL:    {pnl:+.2f} USDT")
 
-            # стоп
-            stop_str = f"Стоп:   {stop:.2f}"
+            lines = [
+                f"📍 BTCUSDT {side} {qty}",
+                f"Entry:  {entry:.2f}",
+                f"Now:    {last_price:.2f}",
+                f"PnL:    {pnl:+.2f} USDT",
+                "",
+            ]
+
+            stop_line = f"Стоп:   {stop:.2f}"
             if stop_ok is True:
-                stop_str += " ✅ на бирже"
+                stop_line += " ✅"
             elif stop_ok is False:
-                stop_str += " ❌ НЕ выставлен"
-            lines.append(stop_str)
+                stop_line += " ⚠️ не выставлен"
+            lines.append(stop_line)
 
-            # цель
             if target > 0:
-                lines.append(f"Цель:   {target:.2f} ({target_source})")
-                if last_price is not None:
-                    if side == 'SHORT':
-                        dist = last_price - target
-                    else:
-                        dist = target - last_price
-                    lines.append(f"До цели: {dist:+.2f} USDT")
+                to_target = abs(target - last_price)
+                lines.append(f"Цель:   {target:.2f} ({src})")
+                lines.append(f"До цели: {to_target:.2f} USDT")
             else:
                 lines.append("Цель:   не задана")
 
+            lines.append("")
             lines.append(f"Открыта: {opened_at}")
-
-            muted = self.is_position_push_muted()
-            lines.append(f"Push:   {'выключен' if muted else 'включен'}")
 
             await update.message.reply_text("\n".join(lines))
         except Exception as e:
-            logger.error(f"position_status failed: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
-    # ------------------------------------------------------------
-    #  Push mute (PATCH 8)
-    # ------------------------------------------------------------
     async def mute_position(self, update: Update,
                             context: ContextTypes.DEFAULT_TYPE):
         try:
-            state = self._read_telegram_state()
+            state = self._read_state()
             state["position_push_muted"] = True
-            self._write_telegram_state(state)
+            self._write_state(state)
             await update.message.reply_text(
-                "🔇 Push по текущей сделке выключен.\n"
-                "Включить: /unmute_position"
-            )
+                "🔇 Push по позиции отключён.\n"
+                "Вернуть: /unmute_position")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     async def unmute_position(self, update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
         try:
-            state = self._read_telegram_state()
+            state = self._read_state()
             state["position_push_muted"] = False
-            self._write_telegram_state(state)
+            self._write_state(state)
             await update.message.reply_text(
-                "🔊 Push по текущей сделке включён."
-            )
+                "🔊 Push по позиции включён (каждые 15 минут).")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 

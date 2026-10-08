@@ -2,34 +2,26 @@
 main.py
 Live-бот на 15m BTCUSDT. Bybit Demo Trading (linear perpetual, leverage=1x).
 
+v8:
+- [PATCH 5] Reconciliation в цикле: раз в N итераций при отсутствии
+  live_position.json проверяем биржу на «бесхозные» позиции.
+- CLOSE_ORPHAN_POSITIONS — флаг.
+
 v7:
-- [PATCH 8] Push о состоянии сделки каждые POSITION_PUSH_INTERVAL_MIN минут.
-  Gate по изменению цены (> X%) или PnL (> Y USDT). Управляется через
-  /mute_position и /unmute_position (флаг в config/telegram_state.json).
-- [PATCH 7] order_mgr передаётся в TelegramBot — для /position и /close.
-- [PATCH 21+] 'symbol' пишется в live_position.json.
-- [PATCH 3+] Сброс mute push при закрытии позиции.
-- TelegramBot создаётся ПОСЛЕ warmup, reconciliation — ДО main loop.
+- [PATCH 27/29/30] Push о состоянии позиции каждые 15 мин.
+- order_mgr прокидывается в TelegramBot.
 
 v6:
-- [PATCH 2] MIN_TARGET_PROFIT — floor, а не фильтр. Цель НИКОГДА не 0.
-- [PATCH 4] STOP_FAIL_FALLBACK_ENABLED — флаг (0 = выключен) для аварийного
-  закрытия позиции, если стоп-маркет не встал.
-- [PATCH 5] CLOSE_POSITIONS_ON_STARTUP / _ON_SHUTDOWN — закрытие всех
-  открытых позиций при старте и остановке бота.
-- [PATCH 21] live_position.json содержит target_source и stop_ok.
+- [PATCH 2] MIN_TARGET_PROFIT — floor.
+- [PATCH 4] STOP_FAIL_FALLBACK_ENABLED.
+- [PATCH 5] CLOSE_POSITIONS_ON_STARTUP / _ON_SHUTDOWN.
+- [PATCH 21] live_position.json: target_source, stop_ok, stop_order_id.
 - [PATCH 36] qty округляется ДО save_live_position.
 - [PATCH 37] entry_price уточняется по фактической avgPrice с биржи.
-
-v5:
-- start_ts захватывается в начале main().
-- upload_journal_to_disk: fallback на расширенное окно.
-- upload_logs_to_disk(since_ts): выгружает только свежие строки.
 """
 from __future__ import annotations
 import sys
 
-# ---------- ПАТЧ pybit для Python 3.8 ----------
 if sys.version_info < (3, 9):
     import subprocess, os
     lib_dir = os.path.join(os.path.dirname(__file__), 'venv', 'lib',
@@ -40,7 +32,6 @@ if sys.version_info < (3, 9):
             f"find {lib_dir} -name '*.py' -exec sed -i 's/defaultdict\\[dict\\]/defaultdict/g' {{}} \\;",
             shell=True, check=False
         )
-# ------------------------------------------------
 
 import asyncio
 import logging
@@ -72,30 +63,23 @@ CANDLE_INTERVAL = "15"
 YAML_PATH = "config/pairs.yaml"
 MANUAL_TARGETS_FILE = "config/manual_targets.json"
 LIVE_POSITION_FILE = "config/live_position.json"
+TELEGRAM_STATE_FILE = "config/telegram_state.json"
 SYMBOLS = ['BTCUSDT']
 
-# ---------- [PATCH 4/5] Фичефлаги ----------
-# [PATCH 4] Fallback при фейле стопа: если market-ордер прошёл, а стоп-маркет
-# не встал — немедленно закрыть позицию по рынку.
-#   0 = выключен (текущий режим отладки — собираем ошибки)
-#   1 = включён
-# ВНИМАНИЕ: перед включением прогнать обратный тест.
+# ---------- Фичефлаги ----------
 STOP_FAIL_FALLBACK_ENABLED = 0
-
-# [PATCH 5] Закрывать все открытые позиции при старте (reconciliation).
 CLOSE_POSITIONS_ON_STARTUP = 1
-
-# [PATCH 5] Закрывать все открытые позиции при остановке бота (/stop_bot).
 CLOSE_POSITIONS_ON_SHUTDOWN = 1
+# [PATCH 5-v8] Закрывать «бесхозные» позиции, найденные в цикле (файла нет,
+# а на бирже позиция есть). 1 = закрывать, 0 = только уведомлять.
+CLOSE_ORPHAN_POSITIONS = 1
+# [PATCH 5-v8] Проверять бесхозные позиции каждые N итераций (30s × N).
+RECONCILE_ORPHAN_EVERY_N = 10
 
-# ---------- [PATCH 8] Push о состоянии сделки ----------
-# Периодичность push в минутах. 0 = выключено.
-# Push также срабатывает только если состояние изменилось
-# (цена сдвинулась > PRICE_DELTA_PCT или PnL > PNL_DELTA_USDT).
-POSITION_PUSH_INTERVAL_MIN = 15
-POSITION_PUSH_PRICE_DELTA_PCT = 0.1     # % от последней цены push
-POSITION_PUSH_PNL_DELTA_USDT = 5.0      # USDT
-# ------------------------------------------------
+# [PATCH 27] Push о позиции каждые 15 мин
+PUSH_INTERVAL_SEC = 15 * 60
+_push_last_ts = 0.0
+_loop_iter = 0
 
 INTERVAL_MS = {
     "1": 60 * 1000, "3": 3 * 60 * 1000, "5": 5 * 60 * 1000,
@@ -134,7 +118,6 @@ for noisy in ("telegram", "telegram.ext", "telegram.ext.ExtBot",
 
 # ---------- Вспомогательные ----------
 def load_manual_target() -> float:
-    """Ручная цель из config/manual_targets.json (0 = не задана)."""
     if not os.path.exists(MANUAL_TARGETS_FILE):
         return 0.0
     try:
@@ -146,7 +129,6 @@ def load_manual_target() -> float:
 
 
 def clear_manual_target() -> None:
-    """Обнуляет ручную цель после закрытия сделки."""
     try:
         data = {}
         if os.path.exists(MANUAL_TARGETS_FILE):
@@ -181,9 +163,54 @@ def clear_live_position() -> None:
         os.remove(LIVE_POSITION_FILE)
 
 
+def _is_push_muted() -> bool:
+    if not os.path.exists(TELEGRAM_STATE_FILE):
+        return False
+    try:
+        with open(TELEGRAM_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("position_push_muted", False))
+    except Exception:
+        return False
+
+
+def _format_position_push(live_pos: dict, last_price: float) -> str:
+    side = live_pos.get("side", "?")
+    entry = float(live_pos.get("entry_price", 0))
+    qty = float(live_pos.get("qty", 0))
+    stop = float(live_pos.get("stop_loss", 0))
+    target = float(live_pos.get("target_price", 0))
+    src = live_pos.get("target_source", "?")
+    stop_ok = live_pos.get("stop_ok", None)
+
+    if side == "LONG":
+        pnl = (last_price - entry) * qty
+        to_target = (target - last_price) if target > 0 else 0
+    else:
+        pnl = (entry - last_price) * qty
+        to_target = (last_price - target) if target > 0 else 0
+
+    lines = [
+        f"⏱ {side} BTCUSDT {qty}",
+        f"Entry:  {entry:.2f}",
+        f"Now:    {last_price:.2f}",
+        f"PnL:    {pnl:+.2f} USDT",
+        "",
+    ]
+    stop_line = f"Стоп:   {stop:.2f}"
+    if stop_ok is True:
+        stop_line += " ✅"
+    elif stop_ok is False:
+        stop_line += " ⚠️"
+    lines.append(stop_line)
+    if target > 0:
+        lines.append(f"Цель:   {target:.2f} ({src})")
+        lines.append(f"До цели: {to_target:.2f} USDT")
+    return "\n".join(lines)
+
+
 def calc_structural_target(side: str, min1: float, max1: float,
                            min2: float, max2: float) -> float:
-    """LONG: min2 + (max1-min1)/2. SHORT: max2 - (max1-min1)/2."""
     impulse = max1 - min1
     if impulse <= 0:
         return 0.0
@@ -196,7 +223,6 @@ def calc_structural_target(side: str, min1: float, max1: float,
 async def fetch_candles(http_session: HTTP, symbol: str,
                         interval: str = CANDLE_INTERVAL,
                         limit: int = HISTORY_LIMIT):
-    """Свечи с mainnet spot — публичный endpoint, ключи не нужны."""
     try:
         end = int(datetime.now().timestamp() * 1000)
         step_ms = INTERVAL_MS.get(interval, 60 * 1000)
@@ -236,9 +262,7 @@ async def get_current_candle(http_session: HTTP, symbol: str):
     return df.iloc[-2]
 
 
-# ---------- Выгрузка логов с фильтром по времени ----------
 def _is_timestamp_line(line: str) -> bool:
-    """YYYY-MM-DD HH:MM:SS — первые 19 символов."""
     return (len(line) >= 19 and line[4] == '-' and line[7] == '-'
             and line[10] == ' ')
 
@@ -246,7 +270,6 @@ def _is_timestamp_line(line: str) -> bool:
 async def upload_logs_to_disk(yadisk: YaDiskSync, since_ts: float,
                               local_path: str = LOG_FILE,
                               remote_dir: str = "grid_bot/logs/"):
-    """Выгружает только строки debug.log с timestamp >= since_ts."""
     if not yadisk:
         return False
     tmp_path = None
@@ -254,9 +277,7 @@ async def upload_logs_to_disk(yadisk: YaDiskSync, since_ts: float,
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         remote_path = remote_dir + f"debug_{timestamp}.log"
         tmp_path = os.path.join("config", f"debug_delta_{timestamp}.log")
-
         cutoff_str = datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S")
-
         kept = 0
         keep = False
         with open(local_path, "r", encoding="utf-8", errors="replace") as src, \
@@ -267,18 +288,15 @@ async def upload_logs_to_disk(yadisk: YaDiskSync, since_ts: float,
                 if keep:
                     dst.write(line)
                     kept += 1
-
         if kept == 0:
             debug_logger.info("Нет новых строк для выгрузки")
             os.remove(tmp_path)
             return True
-
         if yadisk.client.exists(remote_path):
             yadisk.client.remove(remote_path)
         success = yadisk.upload_file(tmp_path, remote_path)
         os.remove(tmp_path)
         tmp_path = None
-
         if success:
             debug_logger.info(f"Лог выгружен: {remote_path} ({kept} строк)")
         return success
@@ -293,10 +311,8 @@ async def upload_logs_to_disk(yadisk: YaDiskSync, since_ts: float,
                 pass
 
 
-# ---------- Выгрузка journalctl ----------
 def upload_journal_to_disk(yadisk, since_ts: int,
                            remote_dir: str = "grid_bot/logs/"):
-    """Выгружает journalctl для gridbot.service с момента since_ts."""
     if not yadisk:
         return None
     local_path = None
@@ -304,7 +320,6 @@ def upload_journal_to_disk(yadisk, since_ts: int,
         ts_str = datetime.fromtimestamp(since_ts).strftime("%Y%m%d_%H%M%S")
         local_path = f"config/journal_{ts_str}.log"
         remote_path = f"{remote_dir}journal_{ts_str}.log"
-
         with open(local_path, "w") as f:
             subprocess.run(
                 ["journalctl", "-u", "gridbot",
@@ -313,7 +328,6 @@ def upload_journal_to_disk(yadisk, since_ts: int,
                 stdout=f, stderr=subprocess.PIPE,
                 check=False, timeout=30,
             )
-
         with open(local_path) as f:
             line_count = sum(1 for _ in f)
         if line_count < 10:
@@ -328,7 +342,6 @@ def upload_journal_to_disk(yadisk, since_ts: int,
                     stdout=f, stderr=subprocess.PIPE,
                     check=False, timeout=30,
                 )
-
         if yadisk.upload_file(local_path, remote_path):
             debug_logger.info(f"journal выгружен: {remote_path}")
             return remote_path
@@ -345,18 +358,14 @@ def upload_journal_to_disk(yadisk, since_ts: int,
                 pass
 
 
-# ---------- Стартовый снимок ----------
 async def startup_snapshot_and_healthcheck(order_mgr, tg, yadisk, start_ts):
     await asyncio.sleep(90)
-
     lines = []
-
     balance = order_mgr.get_wallet_usdt()
     if balance is not None:
         lines.append(f"OK Bybit API (баланс {balance:.2f} USDT)")
     else:
         lines.append("FAIL Bybit API (нет ответа)")
-
     if yadisk is not None:
         try:
             if yadisk.client.exists("grid_bot/config/pairs.yaml"):
@@ -367,13 +376,11 @@ async def startup_snapshot_and_healthcheck(order_mgr, tg, yadisk, start_ts):
             lines.append(f"FAIL Я.Диск ({e})")
     else:
         lines.append("SKIP Я.Диск (токен не задан)")
-
     remote_path = upload_journal_to_disk(yadisk, start_ts)
     if remote_path:
         lines.append("OK journal (выгружен)")
     else:
         lines.append("FAIL journal (см. debug.log)")
-
     if tg is not None:
         try:
             text = "Стартовый снимок:\n" + "\n".join(lines)
@@ -384,7 +391,6 @@ async def startup_snapshot_and_healthcheck(order_mgr, tg, yadisk, start_ts):
             debug_logger.error(f"startup healthcheck: TG send failed: {e}")
 
 
-# ---------- Управление ----------
 running = True
 
 
@@ -393,39 +399,8 @@ def set_running(value: bool):
     running = value
 
 
-# ---------- Push о позиции ----------
-def build_position_push_text(live_pos: dict, last_price: float,
-                             pnl: float) -> str:
-    """[PATCH 8] Компактное сообщение о состоянии сделки."""
-    sym = live_pos.get('symbol', 'BTCUSDT')
-    side = live_pos.get('side', '?')
-    qty = float(live_pos.get('qty', 0.0))
-    entry = float(live_pos.get('entry_price', 0.0))
-    stop = float(live_pos.get('stop_loss', 0.0))
-    target = float(live_pos.get('target_price', 0.0) or 0.0)
-    target_src = live_pos.get('target_source', '?')
-    stop_ok = live_pos.get('stop_ok', None)
-
-    lines = [f"📊 {sym} {side} {qty:.6f}"]
-    lines.append(f"Entry:  {entry:.2f}")
-    lines.append(f"Сейчас: {last_price:.2f}")
-    lines.append(f"PnL:    {pnl:+.2f} USDT")
-
-    stop_str = f"Стоп:   {stop:.2f}"
-    if stop_ok is True:
-        stop_str += " ✅"
-    elif stop_ok is False:
-        stop_str += " ❌"
-    lines.append(stop_str)
-
-    if target > 0:
-        lines.append(f"Цель:   {target:.2f} ({target_src})")
-
-    return "\n".join(lines)
-
-
-# ---------- Основная функция ----------
 async def main():
+    global _push_last_ts, _loop_iter
     start_ts = int(time.time())
 
     # 1. Яндекс.Диск и конфиг
@@ -475,12 +450,30 @@ async def main():
     http_session = HTTP(testnet=False)
     order_mgr = OrderManager()
     risk_mgr = RiskManager(MAX_TOTAL_RISK_PERCENT)
-
     sym = 'BTCUSDT'
-
     order_mgr.set_leverage(sym, leverage=1)
 
-    # 3. Состояние и буферы
+    # [PATCH 5] Reconciliation при старте
+    if CLOSE_POSITIONS_ON_STARTUP:
+        try:
+            stale = order_mgr.get_position(sym)
+            if stale is not None:
+                debug_logger.warning(
+                    f"При старте найдена открытая позиция: "
+                    f"{stale['side']} {stale['qty']} @ {stale['entry_price']}, "
+                    f"закрываю по рынку"
+                )
+                order_mgr.cancel_all_orders(sym)
+                closed_list = order_mgr.close_all_positions()
+                for c in closed_list:
+                    debug_logger.info(f"  закрыто при старте: {c}")
+                clear_live_position()
+                clear_manual_target()
+            else:
+                debug_logger.info("При старте открытых позиций нет")
+        except Exception as e:
+            debug_logger.error(f"startup reconciliation failed: {e}", exc_info=True)
+
     state = {
         'long': {'state': 'WAIT_MIN1', 'min1': None, 'max1': None, 'min2': None},
         'short': {'state': 'WAIT_MAX1', 'max1': None, 'min1': None, 'max2': None}
@@ -489,15 +482,13 @@ async def main():
     buffers = {sym: []}
     last_processed_idx = {sym: -1}
 
-    # 4. Стартовая загрузка истории
+    # 3. История
     df = await fetch_candles(http_session, sym)
     if df.empty:
         debug_logger.error(f"{sym}: не удалось загрузить свечи")
         return
-
     for _, row in df.iterrows():
         buffers[sym].append(row.to_dict())
-
     total_initial = len(buffers[sym])
     debug_logger.info(f"{sym}: загружено {total_initial} свечей ({CANDLE_INTERVAL}m)")
 
@@ -515,13 +506,11 @@ async def main():
             process_block(state, block_start, block_df, params[sym], buffer_df=buffer_df)
             block_idx_buffer = []
             block_start = i + 1
-
         _ = check_entry(state, i, current_candle, params[sym])
-
     last_processed_idx[sym] = total_initial - 1
     debug_logger.info(f"{sym}: стартовая обработка завершена")
 
-    # 5. Telegram
+    # 4. Telegram
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
     tg = None
     if tg_token:
@@ -532,12 +521,12 @@ async def main():
 
         tg = TelegramBot(
             tg_token,
-            order_mgr=order_mgr,   # [PATCH 7]
             stop_callback=lambda: set_running(False),
             sync_callback=lambda: yadisk.sync_if_updated() if yadisk else None,
             upload_logs_callback=upload_logs_callback,
             reload_params_callback=reload_params_from_disk,
             upload_params_callback=upload_params_to_disk,
+            order_mgr=order_mgr,
         )
         await tg.start()
         debug_logger.info("Telegram-бот запущен")
@@ -547,33 +536,6 @@ async def main():
             f"Live-бот запущен ({CANDLE_INTERVAL}m, BTCUSDT, Demo linear, leverage=1x)"
         )
 
-    # 6. [PATCH 5] Reconciliation при старте — после TG, чтобы уведомить.
-    if CLOSE_POSITIONS_ON_STARTUP:
-        try:
-            stale = order_mgr.get_position(sym)
-            if stale is not None:
-                debug_logger.warning(
-                    f"При старте найдена открытая позиция: "
-                    f"{stale['side']} {stale['qty']} @ {stale['entry_price']}, "
-                    f"закрываю по рынку"
-                )
-                order_mgr.cancel_all_orders(sym)
-                closed_list = order_mgr.close_all_positions()
-                for c in closed_list:
-                    debug_logger.info(f"  закрыто при старте: {c}")
-                clear_live_position()
-                clear_manual_target()
-                if tg:
-                    lines = [f"⚠️ При старте закрыто позиций: {len(closed_list)}"]
-                    for c in closed_list:
-                        ok = "✅" if c['success'] else "❌"
-                        lines.append(f"  {ok} {c['symbol']} {c['side']} size={c['size']}")
-                    await tg.send_notification("\n".join(lines))
-            else:
-                debug_logger.info("При старте открытых позиций нет")
-        except Exception as e:
-            debug_logger.error(f"startup reconciliation failed: {e}", exc_info=True)
-
     asyncio.create_task(
         startup_snapshot_and_healthcheck(order_mgr, tg, yadisk, start_ts)
     )
@@ -581,13 +543,11 @@ async def main():
     last_sync = time.time()
     last_log_upload = time.time()
 
-    # [PATCH 8] Состояние push
-    last_push_ts = 0.0
-    last_push_state = None   # {'price': float, 'pnl': float}
-
-    # 7. Главный цикл
+    # 5. Главный цикл
     while running:
         try:
+            _loop_iter += 1
+
             if yadisk and time.time() - last_sync > 300:
                 if yadisk.sync_if_updated():
                     with open(YAML_PATH, "r", encoding="utf-8") as f:
@@ -604,7 +564,7 @@ async def main():
                 upload_journal_to_disk(yadisk, int(time.time()) - 3600)
                 last_log_upload = time.time()
 
-            # --- Проверка открытой позиции ---
+            # --- Проверка открытой позиции (файл есть) ---
             live_pos = load_live_position()
             if live_pos is not None:
                 pos_info = order_mgr.get_position(sym)
@@ -615,22 +575,19 @@ async def main():
                         await tg.send_notification(
                             f"🛑 {live_pos['side']} {sym} закрыта биржей"
                         )
-                        tg.reset_position_push_mute()   # [PATCH 8]
                     clear_manual_target()
                     clear_live_position()
                     order_mgr.cancel_all_orders(sym)
-                    last_push_state = None
+                    _push_last_ts = 0.0
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
-                # [PATCH 21] если стоп помечен как невыставленный — пробуем ещё раз
                 if live_pos.get('stop_ok') is False:
                     retry_stop = live_pos.get('stop_loss', 0.0)
                     if retry_stop > 0:
                         close_side_retry = 'Buy' if live_pos['side'] == 'SHORT' else 'Sell'
                         debug_logger.warning(
-                            f"stop_ok=False — повторная попытка выставить стоп "
-                            f"@{retry_stop}"
+                            f"stop_ok=False — повторная попытка выставить стоп @{retry_stop}"
                         )
                         retry_id = order_mgr.place_stop_market_order(
                             sym, close_side_retry, pos_info['qty'], retry_stop
@@ -645,7 +602,6 @@ async def main():
                                     f"✅ Стоп перевыставлен {sym} @ {retry_stop:.2f}"
                                 )
 
-                # --- Проверка цели ---
                 target = live_pos.get('target_price', 0.0)
                 side = live_pos['side']
                 if target > 0:
@@ -665,61 +621,57 @@ async def main():
                                     await tg.send_notification(
                                         f"🎯 ЦЕЛЬ: {side} {sym} @ {last_price:.2f}"
                                     )
-                                    tg.reset_position_push_mute()   # [PATCH 8]
                                 clear_manual_target()
                                 clear_live_position()
                                 order_mgr.cancel_all_orders(sym)
-                                last_push_state = None
-                                await asyncio.sleep(CHECK_INTERVAL)
-                                continue
+                                _push_last_ts = 0.0
 
-                # [PATCH 8] Push о состоянии сделки
-                if (POSITION_PUSH_INTERVAL_MIN > 0 and tg is not None
-                        and not tg.is_position_push_muted()):
-                    now_ts = time.time()
-                    if now_ts - last_push_ts >= POSITION_PUSH_INTERVAL_MIN * 60:
-                        try:
-                            last_price_now = order_mgr.get_last_price(sym)
-                            if last_price_now is not None:
-                                entry_now = float(live_pos.get('entry_price', 0.0))
-                                qty_now = float(live_pos.get('qty', 0.0))
-                                if side == 'LONG':
-                                    pnl_now = (last_price_now - entry_now) * qty_now
-                                else:
-                                    pnl_now = (entry_now - last_price_now) * qty_now
-
-                                need_push = False
-                                if last_push_state is None:
-                                    need_push = True
-                                else:
-                                    prev_price = last_push_state.get('price', 0.0)
-                                    prev_pnl = last_push_state.get('pnl', 0.0)
-                                    if prev_price > 0:
-                                        dp = abs(last_price_now - prev_price) / prev_price * 100
-                                    else:
-                                        dp = 100.0
-                                    d_pnl = abs(pnl_now - prev_pnl)
-                                    if (dp >= POSITION_PUSH_PRICE_DELTA_PCT or
-                                            d_pnl >= POSITION_PUSH_PNL_DELTA_USDT):
-                                        need_push = True
-
-                                if need_push:
-                                    text = build_position_push_text(
-                                        live_pos, last_price_now, pnl_now
-                                    )
-                                    await tg.send_notification(text)
-                                    last_push_ts = now_ts
-                                    last_push_state = {
-                                        'price': last_price_now,
-                                        'pnl': pnl_now,
-                                    }
-                        except Exception as e:
-                            debug_logger.error(f"position push failed: {e}")
+                if tg and not _is_push_muted():
+                    now = time.time()
+                    if now - _push_last_ts >= PUSH_INTERVAL_SEC:
+                        cur = order_mgr.get_last_price(sym)
+                        if cur is not None:
+                            try:
+                                await tg.send_notification(
+                                    _format_position_push(live_pos, cur)
+                                )
+                                _push_last_ts = now
+                            except Exception as e:
+                                debug_logger.error(f"push failed: {e}")
 
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            # --- Позиции нет — ищем сигнал ---
+            # [PATCH 5-v8] Reconciliation: файла нет — проверить биржу
+            # на «бесхозную» позицию (раз в RECONCILE_ORPHAN_EVERY_N итераций).
+            if _loop_iter % RECONCILE_ORPHAN_EVERY_N == 0:
+                try:
+                    orphan = order_mgr.get_position(sym)
+                    if orphan is not None:
+                        debug_logger.warning(
+                            f"Бесхозная позиция: {orphan['side']} "
+                            f"{orphan['qty']} @ {orphan['entry_price']}, "
+                            f"файла live_position.json нет"
+                        )
+                        if CLOSE_ORPHAN_POSITIONS:
+                            order_mgr.cancel_all_orders(sym)
+                            order_mgr.close_position(sym)
+                            if tg:
+                                await tg.send_notification(
+                                    f"⚠️ Обнаружена бесхозная позиция {sym}: "
+                                    f"{orphan['side']} {orphan['qty']}, закрыта по рынку"
+                                )
+                        else:
+                            if tg:
+                                await tg.send_notification(
+                                    f"⚠️ Бесхозная позиция {sym}: "
+                                    f"{orphan['side']} {orphan['qty']} @ "
+                                    f"{orphan['entry_price']}. Не закрываю (флаг=0)."
+                                )
+                except Exception as e:
+                    debug_logger.error(f"orphan reconcile failed: {e}")
+
+            # --- Сигналов нет — ищем ---
             candle = await get_current_candle(http_session, sym)
             if candle is None:
                 await asyncio.sleep(CHECK_INTERVAL)
@@ -759,11 +711,9 @@ async def main():
                         f"{sym}: СИГНАЛ idx={current_idx} тип={signal['type']} "
                         f"цена={signal['entry_price']:.2f}"
                     )
-
                     entry_price = signal['entry_price']
                     side = signal['type']
 
-                    # --- стоп ---
                     if side == 'LONG':
                         structural_stop_distance = entry_price - signal['min2'][1]
                     else:
@@ -776,8 +726,7 @@ async def main():
                             f"entry={entry_price}, fallback на %-стоп"
                         )
                         structural_stop_distance = (
-                            entry_price
-                            * params[sym]['MAX_STOP_DISTANCE_PERCENT'] / 100
+                            entry_price * params[sym]['MAX_STOP_DISTANCE_PERCENT'] / 100
                         )
 
                     max_allowed_stop_dist = (
@@ -797,7 +746,6 @@ async def main():
                         open_side = 'Sell'
                         close_side = 'Buy'
 
-                    # --- размер позиции ---
                     balance_usdt = order_mgr.get_wallet_usdt() or 1000.0
                     qty = params[sym]['MAX_LOSS_PER_TRADE'] / actual_stop_distance
                     position_value = qty * entry_price
@@ -812,7 +760,6 @@ async def main():
                             f"Маленькая позиция {position_value:.2f}, пропуск"
                         )
                     else:
-                        # [PATCH 2] цель — floor, никогда не 0.
                         min1_p = signal['min1'][1]
                         max1_p = signal['max1'][1]
                         if side == 'LONG':
@@ -838,12 +785,11 @@ async def main():
                             floor_price = entry_price + min_profit
                             target_price = (max(candidate, floor_price)
                                             if candidate > 0 else floor_price)
-                        else:  # SHORT
+                        else:
                             ceiling_price = entry_price - min_profit
                             target_price = (min(candidate, ceiling_price)
                                             if candidate > 0 else ceiling_price)
 
-                        # [PATCH 36] округляем qty ДО отправки и до save
                         qty = order_mgr.round_qty(sym, qty)
                         if qty <= 0:
                             debug_logger.error("qty округлилось до 0, пропуск сигнала")
@@ -856,7 +802,6 @@ async def main():
                                     "Market-ордер не прошёл, сделка не открыта"
                                 )
                             else:
-                                # [PATCH 37] фактическая entry с биржи
                                 actual_pos = order_mgr.get_position(sym)
                                 if actual_pos and actual_pos.get('entry_price', 0) > 0:
                                     actual_entry = actual_pos['entry_price']
@@ -875,7 +820,6 @@ async def main():
                                         target_price = (min(candidate, ceiling_price)
                                                         if candidate > 0 else ceiling_price)
 
-                                # --- стоп ---
                                 stop_order_id = order_mgr.place_stop_market_order(
                                     sym, close_side, qty, stop_loss
                                 )
@@ -897,7 +841,6 @@ async def main():
                                             )
                                     else:
                                         save_live_position({
-                                            'symbol': sym,
                                             'side': side,
                                             'entry_price': entry_price,
                                             'qty': qty,
@@ -921,7 +864,6 @@ async def main():
                                             )
                                 else:
                                     save_live_position({
-                                        'symbol': sym,
                                         'side': side,
                                         'entry_price': entry_price,
                                         'qty': qty,
@@ -933,6 +875,7 @@ async def main():
                                         'order_id': order_id,
                                         'opened_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                     })
+                                    _push_last_ts = time.time()
                                     debug_logger.info(
                                         f"{side} открыт: {sym} {qty:.6f} @ "
                                         f"{entry_price:.2f}, stop={stop_loss:.2f}, "
@@ -948,11 +891,6 @@ async def main():
                                             f"Qty: {qty:.6f}"
                                         )
 
-                                # [PATCH 8] сброс состояния push при новой сделке
-                                last_push_ts = 0.0
-                                last_push_state = None
-
-                    # сброс state
                     state['long']['state'] = 'WAIT_MIN1'
                     state['long']['min1'] = state['long']['max1'] = state['long']['min2'] = None
                     state['short']['state'] = 'WAIT_MAX1'
@@ -966,7 +904,6 @@ async def main():
 
     debug_logger.info("Бот остановлен")
 
-    # [PATCH 5] Закрытие всех позиций при остановке
     if CLOSE_POSITIONS_ON_SHUTDOWN:
         try:
             closed_list = order_mgr.close_all_positions()
