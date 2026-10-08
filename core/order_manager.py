@@ -3,6 +3,14 @@ core/order_manager.py
 Модуль взаимодействия с Bybit Demo Trading (linear perpetual).
 Pleczo зафиксировано на 1x. Поддерживает LONG и SHORT.
 
+v5:
+- [PATCH 1] place_stop_market_order: добавлен triggerDirection.
+  Bybit отвечает "TriggerDirection invalid (10001)", если не передать.
+  Buy  (закрытие SHORT, стоп ВЫШЕ entry) → 1 (rise)
+  Sell (закрытие LONG,  стоп НИЖЕ entry)  → 2 (fall)
+- [PATCH 5] Добавлен close_all_positions() — рыночное закрытие всех
+  открытых позиций. Используется при старте/остановке бота и для /close_all.
+
 v4:
 - Добавлено округление qty до qtyStep биржи (floor — вниз, чтобы не превысить риск).
   Bybit отвечал "Qty invalid (10001)" на 18-значный float.
@@ -259,6 +267,12 @@ class OrderManager:
         if abs(stop_price - raw_price) > 1e-12:
             logger.info(f"stop price округлена: {raw_price:.6f} → {stop_price}")
 
+        # [PATCH 1] triggerDirection — обязателен для условных ордеров
+        # на Bybit linear. Без него биржа отвечает "TriggerDirection invalid (10001)".
+        #   Buy  (закрытие SHORT, стоп ВЫШЕ entry) → 1 (rise)
+        #   Sell (закрытие LONG,  стоп НИЖЕ entry)  → 2 (fall)
+        trigger_direction = 1 if side == "Buy" else 2
+
         try:
             resp = self.session.place_order(
                 category=CATEGORY,
@@ -268,6 +282,7 @@ class OrderManager:
                 qty=str(qty),
                 triggerPrice=str(stop_price),
                 triggerBy="LastPrice",
+                triggerDirection=trigger_direction,   # [PATCH 1]
                 timeInForce="IOC",
                 reduceOnly=True,
                 positionIdx=0,
@@ -275,7 +290,8 @@ class OrderManager:
             if resp.get("retCode") == 0:
                 order_id = resp["result"]["orderId"]
                 logger.info(
-                    f"StopMarket {side} {symbol} {qty} @ {stop_price} → {order_id}"
+                    f"StopMarket {side} {symbol} {qty} @ {stop_price} "
+                    f"(triggerDirection={trigger_direction}) → {order_id}"
                 )
                 return order_id
             logger.error(f"Ошибка stop-market: {resp}")
@@ -356,6 +372,58 @@ class OrderManager:
         close_qty = qty if qty is not None else pos["qty"]
         close_side = "Sell" if pos["side"] == "LONG" else "Buy"
         return self.place_market_order(symbol, close_side, close_qty, reduce_only=True)
+
+    # [PATCH 5] Закрытие всех открытых позиций (все символы).
+    # Используется при старте/остановке бота и для /close_all.
+    def close_all_positions(self) -> list:
+        """
+        Закрывает все открытые позиции на Demo Trading по рынку.
+        Перед закрытием каждой позиции отменяет все её ордера
+        (в т.ч. висящие стопы), чтобы не осталось «призраков».
+        Возвращает список dict с результатами.
+        """
+        results: list = []
+        try:
+            resp = self.session.get_positions(
+                category=CATEGORY, settleCoin="USDT"
+            )
+            if resp.get("retCode") != 0:
+                logger.error(f"close_all_positions: get_positions failed: {resp}")
+                return results
+            positions = resp["result"]["list"]
+            for p in positions:
+                size = float(p.get("size", 0))
+                if size <= 0:
+                    continue
+                symbol = p["symbol"]
+                pos_side = p["side"]  # 'Buy' или 'Sell'
+                close_side = "Sell" if pos_side == "Buy" else "Buy"
+
+                # Отменяем висящие ордера, включая стопы
+                try:
+                    self.cancel_all_orders(symbol)
+                except Exception as e:
+                    logger.warning(f"cancel_all_orders {symbol} failed: {e}")
+
+                logger.info(
+                    f"close_all_positions: закрываю {symbol} "
+                    f"{pos_side} size={size}"
+                )
+                order_id = self.place_market_order(
+                    symbol, close_side, size, reduce_only=True
+                )
+                results.append({
+                    "symbol": symbol,
+                    "side": pos_side,
+                    "size": size,
+                    "order_id": order_id,
+                    "success": order_id is not None,
+                })
+            if not results:
+                logger.info("close_all_positions: открытых позиций нет")
+        except Exception as e:
+            logger.error(f"close_all_positions exception: {e}")
+        return results
 
     # ------------------------------------------------------------
     #  Вспомогательные
