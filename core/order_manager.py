@@ -3,20 +3,21 @@ core/order_manager.py
 Модуль взаимодействия с Bybit Demo Trading (linear perpetual).
 Pleczo зафиксировано на 1x. Поддерживает LONG и SHORT.
 
+v6:
+- [PATCH-FIX] round_qty: устранён float-баг 0.236 → 0.235.
+  Причина была в math.floor(0.236/0.001)=floor(235.99999)=235.
+  Теперь: round до precision+4, потом floor с epsilon.
+- [PATCH-FIX] close_position: reduce-only БЕЗ floor-округления.
+  Шлём точный размер позиции с биржи, иначе остаётся dust 0.001.
+- [PATCH-FIX] Новый метод _place_reduce_market — сырой place_order
+  для reduce-only, без шага округления.
+- [PATCH] Новый метод get_closed_pnl — реальные avg_entry, avg_exit,
+  closedPnl последней закрытой сделки.
+- [PATCH] close_all_positions использует _place_reduce_market.
+
 v5:
-- [PATCH 1] place_stop_market_order: добавлен triggerDirection.
-  Bybit отвечает "TriggerDirection invalid (10001)", если не передать.
-  Buy  (закрытие SHORT, стоп ВЫШЕ entry) → 1 (rise)
-  Sell (закрытие LONG,  стоп НИЖЕ entry)  → 2 (fall)
-- [PATCH 5] close_all_positions() — рыночное закрытие всех позиций.
-
-v4:
-- Округление qty до qtyStep (floor).
-- Округление stop price до tickSize (в сторону entry).
-- Кеш параметров символа.
-
-v3:
-- set_leverage: обработка 110043 (leverage not modified).
+- [PATCH 1] place_stop_market_order: triggerDirection.
+- [PATCH 5] close_all_positions().
 """
 from __future__ import annotations
 import os
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 CATEGORY = "linear"
 LEVERAGE = 1
 
+# Дефолтные фильтры для BTCUSDT linear — если API не ответил
 _DEFAULT_INFO = {
     "qty_step": 0.001,
     "qty_precision": 3,
@@ -51,7 +53,11 @@ class OrderManager:
         self._symbol_info_cache: dict = {}
         logger.info("OrderManager инициализирован (Bybit Demo Trading, linear, leverage=1)")
 
+    # ------------------------------------------------------------
+    #  Настройка
+    # ------------------------------------------------------------
     def set_leverage(self, symbol: str, leverage: int = LEVERAGE) -> bool:
+        """Устанавливает плечо для символа. Для BTCUSDT обязательно перед первой сделкой."""
         try:
             resp = self.session.set_leverage(
                 category=CATEGORY,
@@ -75,13 +81,18 @@ class OrderManager:
             logger.error(f"Исключение set_leverage: {e}")
             return False
 
+    # ------------------------------------------------------------
+    #  Параметры символа (qtyStep, tickSize)
+    # ------------------------------------------------------------
     @staticmethod
     def _precision_from_str(s: str) -> int:
+        """'0.001' -> 3, '0.1' -> 1, '1' -> 0."""
         if "." not in s:
             return 0
         return len(s.split(".")[1])
 
     def _get_symbol_info(self, symbol: str) -> dict:
+        """Кеширует qty_step/tick_size по символу."""
         if symbol in self._symbol_info_cache:
             return self._symbol_info_cache[symbol]
 
@@ -122,15 +133,33 @@ class OrderManager:
         return info
 
     def round_qty(self, symbol: str, qty: float) -> float:
+        """
+        Округляет qty ВНИЗ до qtyStep биржи.
+        Устранён float-баг: math.floor(0.236/0.001)=235 из-за 235.99999.
+        Решение: сначала round до precision+4, потом floor с epsilon.
+        Идемпотентна: round_qty(round_qty(x)) == round_qty(x).
+        """
         info = self._get_symbol_info(symbol)
         step = info["qty_step"]
         precision = info["qty_precision"]
         if step <= 0:
             return qty
-        floored = math.floor(qty / step) * step
+        # 1. Убираем float-шум
+        qty_clean = round(qty, precision + 4)
+        # 2. Считаем количество шагов (round от шума)
+        steps = round(qty_clean / step, 6)
+        # 3. Floor с epsilon — на случай 235.9999999
+        floored = math.floor(steps + 1e-9) * step
         return round(floored, precision)
 
     def round_stop_price(self, symbol: str, price: float, side: str) -> float:
+        """
+        Округляет цену стопа до tickSize.
+        side — сторона ордера ('Sell' для LONG, 'Buy' для SHORT).
+        Стоп округляется В СТОРОНУ entry (короче дистанция, меньше риск):
+        - 'Sell' (LONG, стоп ниже entry) → ceil
+        - 'Buy'  (SHORT, стоп выше entry) → floor
+        """
         info = self._get_symbol_info(symbol)
         tick = info["tick_size"]
         precision = info["tick_precision"]
@@ -142,8 +171,19 @@ class OrderManager:
             rounded = math.floor(price / tick) * tick
         return round(rounded, precision)
 
+    # ------------------------------------------------------------
+    #  Ордера
+    # ------------------------------------------------------------
     def place_market_order(self, symbol: str, side: str, qty: float,
                            reduce_only: bool = False) -> str | None:
+        """
+        Рыночный ордер.
+        side: 'Buy' (открыть LONG или закрыть SHORT), 'Sell' (открыть SHORT или закрыть LONG)
+        reduce_only: True для закрытия позиции
+        qty автоматически округляется до qtyStep.
+        ВНИМАНИЕ: для закрытия позиций используйте close_position /
+        _place_reduce_market, а не этот метод — floor может дать dust.
+        """
         raw_qty = qty
         qty = self.round_qty(symbol, qty)
         if qty <= 0:
@@ -180,6 +220,7 @@ class OrderManager:
 
     def place_limit_order(self, symbol: str, side: str, qty: float,
                           price: float, reduce_only: bool = False) -> str | None:
+        """Лимитный ордер. qty округляется до qtyStep."""
         raw_qty = qty
         qty = self.round_qty(symbol, qty)
         if qty <= 0:
@@ -213,6 +254,11 @@ class OrderManager:
 
     def place_stop_market_order(self, symbol: str, side: str, qty: float,
                                 stop_price: float) -> str | None:
+        """
+        Стоп-маркет (reduceOnly) для защиты открытой позиции.
+        side: 'Sell' для LONG-позиции, 'Buy' для SHORT-позиции.
+        qty округляется до qtyStep, цена стопа — до tickSize (в сторону entry).
+        """
         raw_qty = qty
         qty = self.round_qty(symbol, qty)
         if qty <= 0:
@@ -241,7 +287,7 @@ class OrderManager:
                 qty=str(qty),
                 triggerPrice=str(stop_price),
                 triggerBy="LastPrice",
-                triggerDirection=trigger_direction,   # [PATCH 1]
+                triggerDirection=trigger_direction,
                 timeInForce="IOC",
                 reduceOnly=True,
                 positionIdx=0,
@@ -274,6 +320,7 @@ class OrderManager:
             return False
 
     def cancel_all_orders(self, symbol: str) -> bool:
+        """Отменяет все открытые ордера по символу."""
         try:
             resp = self.session.cancel_all_orders(
                 category=CATEGORY, symbol=symbol,
@@ -287,7 +334,15 @@ class OrderManager:
             logger.error(f"Исключение cancel_all_orders: {e}")
             return False
 
+    # ------------------------------------------------------------
+    #  Позиция
+    # ------------------------------------------------------------
     def get_position(self, symbol: str) -> dict | None:
+        """
+        Возвращает текущую позицию по символу или None.
+        {'side': 'LONG'|'SHORT', 'qty': float, 'entry_price': float,
+         'unrealized_pnl': float, 'stop_loss': float}
+        """
         try:
             resp = self.session.get_positions(category=CATEGORY, symbol=symbol)
             if resp.get("retCode") != 0:
@@ -310,17 +365,63 @@ class OrderManager:
             logger.error(f"Исключение get_position: {e}")
             return None
 
+    def _place_reduce_market(self, symbol: str, side: str,
+                             qty: float) -> str | None:
+        """
+        Reduce-only market БЕЗ floor-округления.
+        Для закрытия позиции: шлём точный размер, который вернула биржа.
+        round до precision (убираем float-шум), но НЕ до шага step.
+        """
+        info = self._get_symbol_info(symbol)
+        precision = info["qty_precision"]
+        qty_clean = round(qty, precision)
+        if qty_clean <= 0:
+            logger.error(f"reduce qty={qty} невалидна после округления")
+            return None
+        try:
+            resp = self.session.place_order(
+                category=CATEGORY,
+                symbol=symbol,
+                side=side,
+                orderType="Market",
+                qty=str(qty_clean),
+                reduceOnly=True,
+                positionIdx=0,
+            )
+            if resp.get("retCode") == 0:
+                order_id = resp["result"]["orderId"]
+                logger.info(
+                    f"Reduce Market {side} {symbol} {qty_clean} → {order_id}"
+                )
+                return order_id
+            logger.error(f"Ошибка reduce market: {resp}")
+            return None
+        except Exception as e:
+            logger.error(f"Исключение reduce market: {e}")
+            return None
+
     def close_position(self, symbol: str, qty: float | None = None) -> str | None:
+        """
+        Закрывает позицию рыночным ордером reduceOnly.
+        БЕЗ floor-округления: шлём точный размер с биржи.
+        Если qty не указан — берёт размер из текущей позиции.
+        """
         pos = self.get_position(symbol)
         if pos is None:
             logger.warning(f"Нет открытой позиции {symbol} для закрытия")
             return None
         close_qty = qty if qty is not None else pos["qty"]
         close_side = "Sell" if pos["side"] == "LONG" else "Buy"
-        return self.place_market_order(symbol, close_side, close_qty, reduce_only=True)
+        return self._place_reduce_market(symbol, close_side, close_qty)
 
-    # [PATCH 5] Закрытие всех открытых позиций.
     def close_all_positions(self) -> list:
+        """
+        Закрывает все открытые позиции на Demo Trading по рынку.
+        Перед закрытием каждой позиции отменяет все её ордера
+        (в т.ч. висящие стопы), чтобы не осталось «призраков».
+        Использует _place_reduce_market — без floor-округления.
+        Возвращает список dict с результатами.
+        """
         results: list = []
         try:
             resp = self.session.get_positions(
@@ -338,6 +439,7 @@ class OrderManager:
                 pos_side = p["side"]  # 'Buy' или 'Sell'
                 close_side = "Sell" if pos_side == "Buy" else "Buy"
 
+                # Отменяем висящие ордера, включая стопы
                 try:
                     self.cancel_all_orders(symbol)
                 except Exception as e:
@@ -347,9 +449,7 @@ class OrderManager:
                     f"close_all_positions: закрываю {symbol} "
                     f"{pos_side} size={size}"
                 )
-                order_id = self.place_market_order(
-                    symbol, close_side, size, reduce_only=True
-                )
+                order_id = self._place_reduce_market(symbol, close_side, size)
                 results.append({
                     "symbol": symbol,
                     "side": pos_side,
@@ -363,6 +463,41 @@ class OrderManager:
             logger.error(f"close_all_positions exception: {e}")
         return results
 
+    # ------------------------------------------------------------
+    #  Закрытые сделки (реальный PnL с биржи)
+    # ------------------------------------------------------------
+    def get_closed_pnl(self, symbol: str) -> dict | None:
+        """
+        Возвращает последнюю закрытую сделку по символу.
+        {'avg_entry': float, 'avg_exit': float, 'closed_pnl': float,
+         'qty': float, 'side': 'LONG'|'SHORT', 'closed_at': str}
+        """
+        try:
+            resp = self.session.get_closed_pnl(
+                category=CATEGORY, symbol=symbol, limit=1,
+            )
+            if resp.get("retCode") != 0:
+                logger.error(f"Ошибка get_closed_pnl: {resp}")
+                return None
+            data = resp["result"]["list"]
+            if not data:
+                return None
+            item = data[0]
+            return {
+                "avg_entry": float(item.get("avgEntryPrice", 0)),
+                "avg_exit": float(item.get("avgExitPrice", 0)),
+                "closed_pnl": float(item.get("closedPnl", 0)),
+                "qty": float(item.get("qty", 0)),
+                "side": "LONG" if item.get("side") == "Sell" else "SHORT",
+                "closed_at": item.get("updatedTime", ""),
+            }
+        except Exception as e:
+            logger.error(f"Исключение get_closed_pnl: {e}")
+            return None
+
+    # ------------------------------------------------------------
+    #  Вспомогательные
+    # ------------------------------------------------------------
     def get_open_orders(self, symbol: str) -> list:
         try:
             resp = self.session.get_open_orders(category=CATEGORY, symbol=symbol)
@@ -375,6 +510,7 @@ class OrderManager:
             return []
 
     def get_wallet_usdt(self) -> float | None:
+        """Баланс USDT на unified-аккаунте."""
         try:
             resp = self.session.get_wallet_balance(accountType="UNIFIED")
             if resp.get("retCode") != 0:
@@ -398,6 +534,7 @@ class OrderManager:
             return None
 
     def get_candles(self, symbol: str, interval: str = "15", limit: int = 100) -> list:
+        """Последние свечи (для main.py). Возвращает список как есть."""
         try:
             resp = self.session.get_kline(
                 category=CATEGORY, symbol=symbol, interval=interval, limit=limit,

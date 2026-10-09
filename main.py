@@ -2,14 +2,22 @@
 main.py
 Live-бот на 15m BTCUSDT. Bybit Demo Trading (linear perpetual, leverage=1x).
 
+v9:
+- [PATCH 38] При закрытии позиции (target или биржа) запрашиваем
+  get_closed_pnl с биржи → шлём в TG фактические avg_entry, avg_exit, closedPnl.
+- [PATCH 38] Формат TG:
+    профит → "🎯 ЗАКРЫТО в ПЛЮС: <side> BTCUSDT @ <exit>"
+    убыток → "🔻 ЗАКРЫТО в МИНУС: <side> BTCUSDT @ <exit>"
+    стоп  → "🛑 СТОП: <side> BTCUSDT @ <exit>"
+- [PATCH 39] continue после закрытия по target — push-after-close больше
+  не отправляется.
+
 v8:
 - [PATCH 5] Reconciliation в цикле: раз в N итераций при отсутствии
   live_position.json проверяем биржу на «бесхозные» позиции.
-- CLOSE_ORPHAN_POSITIONS — флаг.
 
 v7:
 - [PATCH 27/29/30] Push о состоянии позиции каждые 15 мин.
-- order_mgr прокидывается в TelegramBot.
 
 v6:
 - [PATCH 2] MIN_TARGET_PROFIT — floor.
@@ -70,10 +78,7 @@ SYMBOLS = ['BTCUSDT']
 STOP_FAIL_FALLBACK_ENABLED = 0
 CLOSE_POSITIONS_ON_STARTUP = 1
 CLOSE_POSITIONS_ON_SHUTDOWN = 1
-# [PATCH 5-v8] Закрывать «бесхозные» позиции, найденные в цикле (файла нет,
-# а на бирже позиция есть). 1 = закрывать, 0 = только уведомлять.
 CLOSE_ORPHAN_POSITIONS = 1
-# [PATCH 5-v8] Проверять бесхозные позиции каждые N итераций (30s × N).
 RECONCILE_ORPHAN_EVERY_N = 10
 
 # [PATCH 27] Push о позиции каждые 15 мин
@@ -207,6 +212,38 @@ def _format_position_push(live_pos: dict, last_price: float) -> str:
         lines.append(f"Цель:   {target:.2f} ({src})")
         lines.append(f"До цели: {to_target:.2f} USDT")
     return "\n".join(lines)
+
+
+def _format_closed_tg(side: str, sym: str, closed: dict | None,
+                      last_price: float, kind: str) -> str:
+    """
+    [PATCH 38] Формат TG-сообщения о закрытии.
+    kind: 'target' | 'stop' | 'manual'
+    """
+    if closed is not None:
+        exit_price = closed["avg_exit"]
+        realized = closed["closed_pnl"]
+        avg_entry = closed["avg_entry"]
+        qty = closed["qty"]
+
+        if kind == "stop":
+            head = f"🛑 СТОП: {side} {sym} @ {exit_price:.2f}"
+        elif realized >= 0:
+            head = f"🎯 ЗАКРЫТО в ПЛЮС: {side} {sym} @ {exit_price:.2f}"
+        else:
+            head = f"🔻 ЗАКРЫТО в МИНУС: {side} {sym} @ {exit_price:.2f}"
+
+        return (
+            f"{head}\n"
+            f"Вход:  {avg_entry:.2f}\n"
+            f"Выход: {exit_price:.2f}\n"
+            f"Qty:   {qty}\n"
+            f"PnL:   {realized:+.2f} USDT"
+        )
+    # fallback — если closed_pnl не получен
+    if kind == "stop":
+        return f"🛑 {side} {sym} закрыта биржей @ {last_price:.2f}"
+    return f"🎯 ЦЕЛЬ: {side} {sym} @ {last_price:.2f}"
 
 
 def calc_structural_target(side: str, min1: float, max1: float,
@@ -570,11 +607,15 @@ async def main():
                 pos_info = order_mgr.get_position(sym)
 
                 if pos_info is None:
+                    # [PATCH 38] Позиция закрыта биржей — запрашиваем closed_pnl
                     debug_logger.info("Позиция закрыта биржей (стоп или вручную)")
+                    closed = order_mgr.get_closed_pnl(sym)
                     if tg:
-                        await tg.send_notification(
-                            f"🛑 {live_pos['side']} {sym} закрыта биржей"
+                        text = _format_closed_tg(
+                            live_pos.get('side', '?'), sym, closed,
+                            order_mgr.get_last_price(sym) or 0.0, kind='stop'
                         )
+                        await tg.send_notification(text)
                     clear_manual_target()
                     clear_live_position()
                     order_mgr.cancel_all_orders(sym)
@@ -617,14 +658,21 @@ async def main():
                                 debug_logger.info(
                                     f"ЗАКРЫТИЕ ПО TARGET @ {last_price:.2f}"
                                 )
+                                # [PATCH 38] дать бирже обновить closed-pnl
+                                await asyncio.sleep(1.5)
+                                closed = order_mgr.get_closed_pnl(sym)
                                 if tg:
-                                    await tg.send_notification(
-                                        f"🎯 ЦЕЛЬ: {side} {sym} @ {last_price:.2f}"
+                                    text = _format_closed_tg(
+                                        side, sym, closed, last_price, kind='target'
                                     )
+                                    await tg.send_notification(text)
                                 clear_manual_target()
                                 clear_live_position()
                                 order_mgr.cancel_all_orders(sym)
                                 _push_last_ts = 0.0
+                                # [PATCH 39] continue — push-after-close не уйдёт
+                                await asyncio.sleep(CHECK_INTERVAL)
+                                continue
 
                 if tg and not _is_push_muted():
                     now = time.time()
