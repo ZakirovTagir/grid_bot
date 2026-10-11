@@ -2,52 +2,74 @@
 find_swing_points.py
 Бэктест стратегии на основе свинг-точек.
 
-v7 (синхронизация с main.py v6+):
-- [PATCH 16/23] MIN_TARGET_PROFIT как floor, не фильтр. Цель НИКОГДА не 0.
-  Если формула даёт меньше floor — подтягиваем до floor.
-  Клэмпинг делается здесь (в бэктесте), в main.py — там же.
-  Логика идентична, чтобы бэктест и live давали одинаковые цели.
+v8.1:
+- [FIX] params['MAX_LOSS_PER_TRADE'] теперь ЗАПИСЫВАЕТСЯ в рантайме
+  (round(max_loss_usdt, 2)), как в main.py v10. Симметрия с live.
+  В DEFAULT_PARAMS 8.0 — справочный placeholder.
+
+v8 (синхронизация с main.py v10 — [FIX #1]):
+- Новая логика sizing: position-first, не risk-first.
+    position_value = balance × MAX_POSITION_PERCENT / 100
+    qty = position_value / entry_price (floor до 0.001)
+    max_loss_usdt = position_value × MAX_STOP_DISTANCE_PERCENT / 100
+    commissions = position_value × TAKER_FEE × 2
+    price_loss = max_loss_usdt − commissions − 10.0 (буфер)
+    stop_distance = price_loss / qty
+    stop_loss = entry ± stop_distance
+  Если price_loss <= 0 — сигнал пропускается.
+- TAKER_FEE = 0.00055 (жёстко, ставка Bybit linear taker).
+- channel_width / 2.0 в check_entry оставлен для лога.
+- MIN_POSITION_USDT оставлен для безопасности.
+
+v7:
+- MIN_TARGET_PROFIT как floor.
+- Цель НИКОГДА не 0.
 
 v6 (упрощение группы C):
 - Убраны: BREAKEVEN_*, TRAILING_*, двухступенчатая защита.
-- Цель по формуле:
-    LONG:  target = min2 + (max1 - min1) / 2
-    SHORT: target = max2 - (max1 - min1) / 2
-- Активация цели: target > entry ± MIN_TARGET_PROFIT,
-  и bars_since_entry >= TARGET_BARS_DELAY.
-- Ручная цель через MANUAL_TARGET_PRICE (для live, в бэктесте можно тестировать).
-- Приоритет проверки: сначала стоп, потом цель.
+- Цель по формуле: LONG: min2 + (max1-min1)/2, SHORT: max2 - (max1-min1)/2.
+- Ручная цель через MANUAL_TARGET_PRICE.
 """
 
+import math
 import pandas as pd
 import sys
 from typing import Dict, Any, List, Optional
 
 
 # ============================================================
-#  Дефолтные параметры
+#  Дефолтные параметры (актуальные значения из pairs.yaml)
 # ============================================================
 DEFAULT_PARAMS = {
     # --- группа A: структура ---
     'N': 7,
     'MIN_BODY_RATIO': 0.3,
-    'DELTA_PRICE': 116.35,
-    'MIN_DISTANCE_BARS':12,
+    'DELTA_PRICE': 117.53,
+    'MIN_DISTANCE_BARS': 10,
     'MAX_DELTA_EXTREMES': 4.0,
     # --- группа B: вход ---
-    'ENTRY_TOLERANCE_USD': 75.85,
+    'ENTRY_TOLERANCE_USD': 68.7,
     'MIN_BARS_AFTER_POINT2': 3,
     'MAX_BARS_AFTER_POINT2': 10,
     # --- группа C: управление ---
+    # MAX_LOSS_PER_TRADE — вычисляется в рантайме (8.0 — справочный placeholder)
     'MAX_LOSS_PER_TRADE': 8.0,
     'MAX_STOP_DISTANCE_PERCENT': 2.5,
     'MAX_POSITION_PERCENT': 95.0,
     'MIN_POSITION_USDT': 10.0,
-    'MIN_TARGET_PROFIT': 200.0,      # USDT: минимальный профит до цели (FLOOR)
-    'TARGET_BARS_DELAY': 3,          # баров: задержка активации цели
-    'MANUAL_TARGET_PRICE': 0.0,      # 0 = использовать формулу; >0 = ручная цель
-    'TRADING_FEE': 0.001,
+    'MIN_TARGET_PROFIT': 200.0,         # USDT: минимальный профит до цели (FLOOR)
+    'TARGET_BARS_DELAY': 3,             # баров: задержка активации цели
+    'MANUAL_TARGET_PRICE': 0.0,         # 0 = формула; >0 = ручная цель
 }
+
+# Taker-комиссия Bybit linear (жёстко, ставка 0.055%)
+TAKER_FEE = 0.00055
+
+# Буфер проскальзывания для стопа (USDT, инлайн)
+SLIPPAGE_BUFFER_USDT = 10.0
+
+# Шаг qty для BTCUSDT (floor)
+QTY_STEP = 0.001
 
 INPUT_CSV = "data/historical/BTCUSDT_15.csv"
 OUTPUT_LOG = "swing_points_log.txt"
@@ -123,6 +145,20 @@ def calc_structural_target(side: str, min1_price: float,
         return min2_price + impulse / 2.0
     else:
         return max2_price - impulse / 2.0
+
+
+def floor_qty(qty: float, step: float = QTY_STEP) -> float:
+    """Floor qty до шага биржи (как в order_manager.round_qty)."""
+    if step <= 0:
+        return qty
+    precision = 0
+    s = f"{step}"
+    if "." in s:
+        precision = len(s.split(".")[1])
+    qty_clean = round(qty, precision + 4)
+    steps = round(qty_clean / step, 6)
+    floored = math.floor(steps + 1e-9) * step
+    return round(floored, precision)
 
 
 # ============================================================
@@ -217,7 +253,6 @@ class LongFinder:
 
         if low <= support + entry_tolerance and high >= support - entry_tolerance:
             channel_width = self.max1_price - self.min1_price
-            structural_stop_distance = channel_width / 2.0
             return {
                 'type': 'LONG',
                 'entry_price': support,
@@ -225,7 +260,7 @@ class LongFinder:
                 'min1': (self.min1_idx, self.min1_price),
                 'max1': (self.max1_idx, self.max1_price),
                 'min2': (self.min2_idx, self.min2_price),
-                'structural_stop_distance': structural_stop_distance,
+                'channel_width': channel_width,
             }
         return None
 
@@ -322,7 +357,6 @@ class ShortFinder:
 
         if low <= resistance + entry_tolerance and high >= resistance - entry_tolerance:
             channel_width = self.max1_price - self.min1_price
-            structural_stop_distance = channel_width / 2.0
             return {
                 'type': 'SHORT',
                 'entry_price': resistance,
@@ -330,7 +364,7 @@ class ShortFinder:
                 'max1': (self.max1_idx, self.max1_price),
                 'min1': (self.min1_idx, self.min1_price),
                 'max2': (self.max2_idx, self.max2_price),
-                'structural_stop_distance': structural_stop_distance,
+                'channel_width': channel_width,
             }
         return None
 
@@ -372,7 +406,7 @@ def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any], callback=None) -> N
 
 
 # ============================================================
-#  Сборщики статистики (для оптимизатора, не трогаем)
+#  Сборщики статистики (для оптимизатора)
 # ============================================================
 def collect_block_amplitudes(df: pd.DataFrame, n: int = 7) -> List[float]:
     amplitudes = []
@@ -481,14 +515,12 @@ def run_backtest(params: Dict[str, Any],
                  verbose: bool = False) -> Dict[str, Any]:
 
     N = params['N']
-    MAX_LOSS_PER_TRADE = params['MAX_LOSS_PER_TRADE']
     MAX_STOP_DISTANCE_PERCENT = params['MAX_STOP_DISTANCE_PERCENT']
     MAX_POSITION_PERCENT = params['MAX_POSITION_PERCENT']
     MIN_POSITION_USDT = params['MIN_POSITION_USDT']
     MIN_TARGET_PROFIT = params['MIN_TARGET_PROFIT']
     TARGET_BARS_DELAY = params['TARGET_BARS_DELAY']
     MANUAL_TARGET_PRICE = params.get('MANUAL_TARGET_PRICE', 0.0)
-    TRADING_FEE = params['TRADING_FEE']
 
     long_finder = LongFinder(df, params)
     short_finder = ShortFinder(df, params)
@@ -517,7 +549,7 @@ def run_backtest(params: Dict[str, Any],
             high = current_candle['high']
             low = current_candle['low']
 
-            # ---- 1. Проверка стопа (всегда первый приоритет) ----
+            # ---- 1. Проверка стопа ----
             stop_hit = False
             if side == 'LONG' and low <= stop_loss:
                 stop_hit = True
@@ -526,7 +558,7 @@ def run_backtest(params: Dict[str, Any],
 
             if stop_hit:
                 exit_price = stop_loss
-                commission = qty * exit_price * TRADING_FEE
+                commission = qty * exit_price * TAKER_FEE
                 if side == 'LONG':
                     balance += qty * exit_price - commission
                 else:
@@ -555,7 +587,7 @@ def run_backtest(params: Dict[str, Any],
 
                 if target_hit:
                     exit_price = target_price
-                    commission = qty * exit_price * TRADING_FEE
+                    commission = qty * exit_price * TAKER_FEE
                     if side == 'LONG':
                         balance += qty * exit_price - commission
                     else:
@@ -586,67 +618,62 @@ def run_backtest(params: Dict[str, Any],
             for finder, _label in [(long_finder, 'LONG'), (short_finder, 'SHORT')]:
                 signal = finder.check_entry(i, current_candle)
                 if signal is not None:
-                    entry_price = signal['entry_price']
-                    structural_stop_distance = signal['structural_stop_distance']
+                    signal_entry = signal['entry_price']
+                    side = signal['type']
 
-                    if signal['type'] == 'LONG':
-                        structural_stop = entry_price - structural_stop_distance
-                    else:
-                        structural_stop = entry_price + structural_stop_distance
+                    # ============================================================
+                    # [FIX #1] Новая логика sizing: position-first
+                    # ============================================================
+                    position_value = balance * MAX_POSITION_PERCENT / 100
+                    max_loss_usdt = position_value * MAX_STOP_DISTANCE_PERCENT / 100
+                    params['MAX_LOSS_PER_TRADE'] = round(max_loss_usdt, 2)   # [FIX] запись в params
+                    commissions = position_value * TAKER_FEE * 2
+                    price_loss = max_loss_usdt - commissions - SLIPPAGE_BUFFER_USDT
 
-                    max_allowed_stop_dist = entry_price * MAX_STOP_DISTANCE_PERCENT / 100
-                    if structural_stop_distance <= max_allowed_stop_dist:
-                        stop_loss = structural_stop
-                        actual_stop_distance = structural_stop_distance
-                    else:
-                        if signal['type'] == 'LONG':
-                            stop_loss = entry_price - max_allowed_stop_dist
-                        else:
-                            stop_loss = entry_price + max_allowed_stop_dist
-                        actual_stop_distance = max_allowed_stop_dist
-
-                    qty = MAX_LOSS_PER_TRADE / actual_stop_distance
-                    position_value = qty * entry_price
-
-                    if position_value < MIN_POSITION_USDT:
-                        qty = MIN_POSITION_USDT / entry_price
-                        max_stop_distance = MAX_LOSS_PER_TRADE / qty if qty > 0 else 0
-                        new_stop_distance = min(actual_stop_distance, max_stop_distance)
-                        if signal['type'] == 'LONG':
-                            stop_loss = entry_price - new_stop_distance
-                        else:
-                            stop_loss = entry_price + new_stop_distance
-                        actual_stop_distance = new_stop_distance
-                        qty = MAX_LOSS_PER_TRADE / actual_stop_distance
-                        position_value = qty * entry_price
-
-                    max_position_usdt = balance * MAX_POSITION_PERCENT / 100
-                    if position_value > max_position_usdt:
-                        position_value = max_position_usdt
-                        qty = position_value / entry_price
-                        if qty > 0:
-                            actual_stop_distance = MAX_LOSS_PER_TRADE / qty
-                            if signal['type'] == 'LONG':
-                                stop_loss = entry_price - actual_stop_distance
-                            else:
-                                stop_loss = entry_price + actual_stop_distance
-
-                    if position_value < MIN_POSITION_USDT:
+                    if price_loss <= 0:
                         events.append({
                             'type': 'entry_cancelled',
-                            'details': f"малая позиция ({position_value:.2f} < {MIN_POSITION_USDT})",
-                            'trend': signal['type']
+                            'trend': side,
+                            'details': (f"price_loss={price_loss:.2f} <= 0 "
+                                        f"(pos={position_value:.2f} max_loss={max_loss_usdt:.2f} "
+                                        f"comm={commissions:.2f})")
                         })
                         finder.reset()
                         continue
 
+                    if position_value < MIN_POSITION_USDT:
+                        events.append({
+                            'type': 'entry_cancelled',
+                            'trend': side,
+                            'details': (f"малая позиция ({position_value:.2f} "
+                                        f"< {MIN_POSITION_USDT})")
+                        })
+                        finder.reset()
+                        continue
+
+                    qty_raw = position_value / signal_entry
+                    qty = floor_qty(qty_raw, QTY_STEP)
+
+                    if qty <= 0:
+                        events.append({
+                            'type': 'entry_cancelled',
+                            'trend': side,
+                            'details': f"qty={qty} после floor, пропуск"
+                        })
+                        finder.reset()
+                        continue
+
+                    stop_distance = price_loss / qty
+
+                    if side == 'LONG':
+                        stop_loss = signal_entry - stop_distance
+                    else:
+                        stop_loss = signal_entry + stop_distance
+
                     # ---- Целевая цена ----
-                    # [PATCH 16/23] MIN_TARGET_PROFIT как floor, синхронно с main.py.
-                    # Цель НИКОГДА не 0. Если формула даёт меньше floor — подтягиваем.
-                    # Клэмпинг делается здесь, в main.py — там же.
                     min1_p = signal['min1'][1]
                     max1_p = signal['max1'][1]
-                    if signal['type'] == 'LONG':
+                    if side == 'LONG':
                         min2_p = signal['min2'][1]
                         max2_p = 0.0
                     else:
@@ -657,28 +684,29 @@ def run_backtest(params: Dict[str, Any],
                         candidate = MANUAL_TARGET_PRICE
                     else:
                         candidate = calc_structural_target(
-                            signal['type'], min1_p, max1_p, min2_p, max2_p
+                            side, min1_p, max1_p, min2_p, max2_p
                         )
 
-                    if signal['type'] == 'LONG':
-                        floor_price = entry_price + MIN_TARGET_PROFIT
+                    if side == 'LONG':
+                        floor_price = signal_entry + MIN_TARGET_PROFIT
                         target_price = (max(candidate, floor_price)
                                         if candidate > 0 else floor_price)
                     else:
-                        ceiling_price = entry_price - MIN_TARGET_PROFIT
+                        ceiling_price = signal_entry - MIN_TARGET_PROFIT
                         target_price = (min(candidate, ceiling_price)
                                         if candidate > 0 else ceiling_price)
 
-                    commission_open = position_value * TRADING_FEE
+                    # ---- Баланс при открытии ----
+                    commission_open = position_value * TAKER_FEE
                     balance_before = balance
-                    if signal['type'] == 'LONG':
+                    if side == 'LONG':
                         balance -= position_value + commission_open
                     else:
                         balance += position_value - commission_open
 
                     position = {
-                        'side': signal['type'],
-                        'entry_price': entry_price,
+                        'side': side,
+                        'entry_price': signal_entry,
                         'qty': qty,
                         'stop_loss': stop_loss,
                         'target_price': target_price,
@@ -705,9 +733,13 @@ def run_backtest(params: Dict[str, Any],
                                            'price': trend_points['max2'][1], 'trend': 'SHORT'})
 
                     events.append({
-                        'type': 'entry', 'idx': i, 'price': entry_price, 'trend': signal['type'],
-                        'details': f"stop_loss:{stop_loss:.2f}, target:{target_price:.2f}, "
-                                   f"qty:{qty:.6f}, pos_value:{position_value:.2f}"
+                        'type': 'entry', 'idx': i, 'price': signal_entry, 'trend': side,
+                        'details': (f"stop_loss:{stop_loss:.2f} (dist:{stop_distance:.2f}), "
+                                    f"target:{target_price:.2f}, "
+                                    f"qty:{qty:.6f}, pos_value:{position_value:.2f}, "
+                                    f"max_loss:{max_loss_usdt:.2f}, price_loss:{price_loss:.2f}, "
+                                    f"comm:{commissions:.2f}, "
+                                    f"channel_width:{signal.get('channel_width', 0):.2f}")
                     })
 
                     finder.reset()
@@ -715,12 +747,13 @@ def run_backtest(params: Dict[str, Any],
 
         i += 1
 
+    # ---- Закрытие последней позиции по концу периода ----
     if position is not None:
         last_price = df.iloc[-1]['close']
         exit_price = last_price
         reason = 'end_of_period'
         qty = position['qty']
-        commission = qty * exit_price * TRADING_FEE
+        commission = qty * exit_price * TAKER_FEE
         if position['side'] == 'LONG':
             balance += qty * exit_price - commission
         else:
@@ -733,6 +766,7 @@ def run_backtest(params: Dict[str, Any],
         })
         equity_curve.append(balance)
 
+    # ---- Метрики ----
     total_trades = sum(1 for e in events if e['type'] == 'exit')
     profitable = 0
     losing = 0
@@ -787,6 +821,7 @@ def run_backtest(params: Dict[str, Any],
             print(f"Win rate: {result['win_rate'] * 100:.1f}%")
             print(f"Max drawdown: {result['max_drawdown_pct']:.2f}%")
         print(f"Событий в логе: {len(events)}")
+        print(f"MAX_LOSS_PER_TRADE (последнее): {params.get('MAX_LOSS_PER_TRADE')}")
 
     if save_events_path is not None:
         save_events(events, df, save_events_path)

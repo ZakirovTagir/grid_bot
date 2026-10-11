@@ -2,29 +2,36 @@
 main.py
 Live-бот на 15m BTCUSDT. Bybit Demo Trading (linear perpetual, leverage=1x).
 
+v10:
+- [FIX #1] Новая логика sizing: position-first, не risk-first.
+    position_value = balance × MAX_POSITION_PERCENT / 100
+    qty = position_value / entry_price
+    MAX_LOSS_PER_TRADE = position_value × MAX_STOP_DISTANCE_PERCENT / 100  (вычисляется)
+    commissions = position_value × taker_fee × 2
+    price_loss = MAX_LOSS_PER_TRADE − commissions − 10.0 (буфер)
+    stop_distance = price_loss / qty
+    stop_loss = entry ± stop_distance
+  Если price_loss <= 0 — сигнал пропускается.
+- [FIX #1] min1/max1 больше не используются для стопа (только для цели).
+- [FIX #1] taker_fee получается с биржи через order_mgr.get_taker_fee().
+- [FIX #1] Стоп и цель пересчитываются от ФАКТИЧЕСКОЙ entry (PATCH 37 остаётся).
+
 v9:
-- [PATCH 38] При закрытии позиции (target или биржа) запрашиваем
-  get_closed_pnl с биржи → шлём в TG фактические avg_entry, avg_exit, closedPnl.
-- [PATCH 38] Формат TG:
-    профит → "🎯 ЗАКРЫТО в ПЛЮС: <side> BTCUSDT @ <exit>"
-    убыток → "🔻 ЗАКРЫТО в МИНУС: <side> BTCUSDT @ <exit>"
-    стоп  → "🛑 СТОП: <side> BTCUSDT @ <exit>"
-- [PATCH 39] continue после закрытия по target — push-after-close больше
-  не отправляется.
+- [PATCH 38] get_closed_pnl + новый формат TG (ЗАКРЫТО в ПЛЮС/МИНУС/СТОП).
+- [PATCH 39] continue после target close.
 
 v8:
-- [PATCH 5] Reconciliation в цикле: раз в N итераций при отсутствии
-  live_position.json проверяем биржу на «бесхозные» позиции.
+- [PATCH 5] Reconciliation в цикле, orphan positions.
 
 v7:
 - [PATCH 27/29/30] Push о состоянии позиции каждые 15 мин.
 
 v6:
-- [PATCH 2] MIN_TARGET_PROFIT — floor.
+- [PATCH 2] MIN_TARGET_PROFIT как floor.
 - [PATCH 4] STOP_FAIL_FALLBACK_ENABLED.
-- [PATCH 5] CLOSE_POSITIONS_ON_STARTUP / _ON_SHUTDOWN.
+- [PATCH 5] CLOSE_POSITIONS_ON_STARTUP / ON_SHUTDOWN.
 - [PATCH 21] live_position.json: target_source, stop_ok, stop_order_id.
-- [PATCH 36] qty округляется ДО save_live_position.
+- [PATCH 36] qty округляется ДО save.
 - [PATCH 37] entry_price уточняется по фактической avgPrice с биржи.
 """
 from __future__ import annotations
@@ -216,10 +223,6 @@ def _format_position_push(live_pos: dict, last_price: float) -> str:
 
 def _format_closed_tg(side: str, sym: str, closed: dict | None,
                       last_price: float, kind: str) -> str:
-    """
-    [PATCH 38] Формат TG-сообщения о закрытии.
-    kind: 'target' | 'stop' | 'manual'
-    """
     if closed is not None:
         exit_price = closed["avg_exit"]
         realized = closed["closed_pnl"]
@@ -240,7 +243,6 @@ def _format_closed_tg(side: str, sym: str, closed: dict | None,
             f"Qty:   {qty}\n"
             f"PnL:   {realized:+.2f} USDT"
         )
-    # fallback — если closed_pnl не получен
     if kind == "stop":
         return f"🛑 {side} {sym} закрыта биржей @ {last_price:.2f}"
     return f"🎯 ЦЕЛЬ: {side} {sym} @ {last_price:.2f}"
@@ -490,6 +492,10 @@ async def main():
     sym = 'BTCUSDT'
     order_mgr.set_leverage(sym, leverage=1)
 
+    # [FIX #1] taker_fee — получаем с биржи один раз
+    taker_fee = order_mgr.get_taker_fee(sym)
+    debug_logger.info(f"taker_fee для {sym}: {taker_fee}")
+
     # [PATCH 5] Reconciliation при старте
     if CLOSE_POSITIONS_ON_STARTUP:
         try:
@@ -570,7 +576,8 @@ async def main():
 
     if tg:
         await tg.send_notification(
-            f"Live-бот запущен ({CANDLE_INTERVAL}m, BTCUSDT, Demo linear, leverage=1x)"
+            f"Live-бот запущен ({CANDLE_INTERVAL}m, BTCUSDT, Demo linear, leverage=1x)\n"
+            f"taker_fee: {taker_fee}"
         )
 
     asyncio.create_task(
@@ -601,13 +608,12 @@ async def main():
                 upload_journal_to_disk(yadisk, int(time.time()) - 3600)
                 last_log_upload = time.time()
 
-            # --- Проверка открытой позиции (файл есть) ---
+            # --- Проверка открытой позиции ---
             live_pos = load_live_position()
             if live_pos is not None:
                 pos_info = order_mgr.get_position(sym)
 
                 if pos_info is None:
-                    # [PATCH 38] Позиция закрыта биржей — запрашиваем closed_pnl
                     debug_logger.info("Позиция закрыта биржей (стоп или вручную)")
                     closed = order_mgr.get_closed_pnl(sym)
                     if tg:
@@ -658,7 +664,6 @@ async def main():
                                 debug_logger.info(
                                     f"ЗАКРЫТИЕ ПО TARGET @ {last_price:.2f}"
                                 )
-                                # [PATCH 38] дать бирже обновить closed-pnl
                                 await asyncio.sleep(1.5)
                                 closed = order_mgr.get_closed_pnl(sym)
                                 if tg:
@@ -670,7 +675,6 @@ async def main():
                                 clear_live_position()
                                 order_mgr.cancel_all_orders(sym)
                                 _push_last_ts = 0.0
-                                # [PATCH 39] continue — push-after-close не уйдёт
                                 await asyncio.sleep(CHECK_INTERVAL)
                                 continue
 
@@ -690,8 +694,7 @@ async def main():
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            # [PATCH 5-v8] Reconciliation: файла нет — проверить биржу
-            # на «бесхозную» позицию (раз в RECONCILE_ORPHAN_EVERY_N итераций).
+            # [PATCH 5-v8] Orphan reconcile
             if _loop_iter % RECONCILE_ORPHAN_EVERY_N == 0:
                 try:
                     orphan = order_mgr.get_position(sym)
@@ -759,134 +762,167 @@ async def main():
                         f"{sym}: СИГНАЛ idx={current_idx} тип={signal['type']} "
                         f"цена={signal['entry_price']:.2f}"
                     )
-                    entry_price = signal['entry_price']
+                    signal_entry = signal['entry_price']
                     side = signal['type']
 
-                    if side == 'LONG':
-                        structural_stop_distance = entry_price - signal['min2'][1]
-                    else:
-                        structural_stop_distance = signal['max2'][1] - entry_price
-
-                    if structural_stop_distance <= 0:
-                        debug_logger.error(
-                            f"Некорректная structural_stop_distance="
-                            f"{structural_stop_distance} для {side}, "
-                            f"entry={entry_price}, fallback на %-стоп"
-                        )
-                        structural_stop_distance = (
-                            entry_price * params[sym]['MAX_STOP_DISTANCE_PERCENT'] / 100
-                        )
-
-                    max_allowed_stop_dist = (
-                        entry_price * params[sym]['MAX_STOP_DISTANCE_PERCENT'] / 100
-                    )
-                    if structural_stop_distance <= max_allowed_stop_dist:
-                        actual_stop_distance = structural_stop_distance
-                    else:
-                        actual_stop_distance = max_allowed_stop_dist
-
-                    if side == 'LONG':
-                        stop_loss = entry_price - actual_stop_distance
-                        open_side = 'Buy'
-                        close_side = 'Sell'
-                    else:
-                        stop_loss = entry_price + actual_stop_distance
-                        open_side = 'Sell'
-                        close_side = 'Buy'
-
+                    # ============================================================
+                    # [FIX #1] Новая логика sizing: position-first
+                    # ============================================================
                     balance_usdt = order_mgr.get_wallet_usdt() or 1000.0
-                    qty = params[sym]['MAX_LOSS_PER_TRADE'] / actual_stop_distance
-                    position_value = qty * entry_price
+                    position_value = balance_usdt * params[sym]['MAX_POSITION_PERCENT'] / 100
 
-                    max_pos = balance_usdt * params[sym]['MAX_POSITION_PERCENT'] / 100
-                    if position_value > max_pos:
-                        position_value = max_pos
-                        qty = position_value / entry_price
+                    # MAX_LOSS_PER_TRADE — вычисляется, пишется в params (для отображения)
+                    max_loss_usdt = position_value * params[sym]['MAX_STOP_DISTANCE_PERCENT'] / 100
+                    params[sym]['MAX_LOSS_PER_TRADE'] = round(max_loss_usdt, 2)
 
-                    if position_value < params[sym]['MIN_POSITION_USDT']:
-                        debug_logger.warning(
-                            f"Маленькая позиция {position_value:.2f}, пропуск"
+                    # Комиссии (вход + выход, taker)
+                    commissions = position_value * taker_fee * 2
+
+                    # Буфер проскальзывания — инлайн 10 USDT
+                    price_loss = max_loss_usdt - commissions - 10.0
+
+                    debug_logger.info(
+                        f"[SIZING] balance={balance_usdt:.2f} position={position_value:.2f} "
+                        f"max_loss={max_loss_usdt:.2f} commissions={commissions:.2f} "
+                        f"price_loss={price_loss:.2f}"
+                    )
+
+                    if price_loss <= 0:
+                        debug_logger.error(
+                            f"price_loss={price_loss:.2f} <= 0, сигнал пропущен"
                         )
                     else:
-                        min1_p = signal['min1'][1]
-                        max1_p = signal['max1'][1]
-                        if side == 'LONG':
-                            min2_p = signal['min2'][1]
-                            max2_p = 0.0
-                        else:
-                            min2_p = 0.0
-                            max2_p = signal['max2'][1]
-
-                        manual_target = load_manual_target()
-                        min_profit = params[sym].get('MIN_TARGET_PROFIT', 200.0)
-
-                        if manual_target > 0:
-                            candidate = manual_target
-                            target_source = 'manual'
-                        else:
-                            candidate = calc_structural_target(
-                                side, min1_p, max1_p, min2_p, max2_p
-                            )
-                            target_source = 'formula'
+                        qty = position_value / signal_entry
+                        stop_distance = price_loss / qty
 
                         if side == 'LONG':
-                            floor_price = entry_price + min_profit
-                            target_price = (max(candidate, floor_price)
-                                            if candidate > 0 else floor_price)
+                            stop_loss = signal_entry - stop_distance
+                            open_side = 'Buy'
+                            close_side = 'Sell'
                         else:
-                            ceiling_price = entry_price - min_profit
-                            target_price = (min(candidate, ceiling_price)
-                                            if candidate > 0 else ceiling_price)
+                            stop_loss = signal_entry + stop_distance
+                            open_side = 'Sell'
+                            close_side = 'Buy'
 
-                        qty = order_mgr.round_qty(sym, qty)
-                        if qty <= 0:
-                            debug_logger.error("qty округлилось до 0, пропуск сигнала")
-                        else:
-                            order_id = order_mgr.place_market_order(
-                                sym, open_side, qty
+                        if position_value < params[sym]['MIN_POSITION_USDT']:
+                            debug_logger.warning(
+                                f"Маленькая позиция {position_value:.2f}, пропуск"
                             )
-                            if not order_id:
-                                debug_logger.error(
-                                    "Market-ордер не прошёл, сделка не открыта"
-                                )
+                        else:
+                            # --- Цель ---
+                            min1_p = signal['min1'][1]
+                            max1_p = signal['max1'][1]
+                            if side == 'LONG':
+                                min2_p = signal['min2'][1]
+                                max2_p = 0.0
                             else:
-                                actual_pos = order_mgr.get_position(sym)
-                                if actual_pos and actual_pos.get('entry_price', 0) > 0:
-                                    actual_entry = actual_pos['entry_price']
-                                    if abs(actual_entry - entry_price) > 1e-6:
-                                        debug_logger.info(
-                                            f"entry уточнена с биржи: "
-                                            f"{entry_price:.2f} → {actual_entry:.2f}"
-                                        )
-                                    entry_price = actual_entry
-                                    if side == 'LONG':
-                                        floor_price = entry_price + min_profit
-                                        target_price = (max(candidate, floor_price)
-                                                        if candidate > 0 else floor_price)
-                                    else:
-                                        ceiling_price = entry_price - min_profit
-                                        target_price = (min(candidate, ceiling_price)
-                                                        if candidate > 0 else ceiling_price)
+                                min2_p = 0.0
+                                max2_p = signal['max2'][1]
 
-                                stop_order_id = order_mgr.place_stop_market_order(
-                                    sym, close_side, qty, stop_loss
+                            manual_target = load_manual_target()
+                            min_profit = params[sym].get('MIN_TARGET_PROFIT', 200.0)
+
+                            if manual_target > 0:
+                                candidate = manual_target
+                                target_source = 'manual'
+                            else:
+                                candidate = calc_structural_target(
+                                    side, min1_p, max1_p, min2_p, max2_p
                                 )
-                                stop_ok = stop_order_id is not None
+                                target_source = 'formula'
 
-                                if not stop_ok:
-                                    debug_logger.error("Стоп-маркет не выставлен!")
-                                    if STOP_FAIL_FALLBACK_ENABLED:
-                                        debug_logger.warning(
-                                            "Fallback активен: закрываю позицию по рынку"
-                                        )
-                                        order_mgr.close_position(sym)
-                                        order_mgr.cancel_all_orders(sym)
-                                        clear_live_position()
-                                        clear_manual_target()
-                                        if tg:
-                                            await tg.send_notification(
-                                                f"⚠️ Стоп не встал, позиция закрыта: {sym}"
+                            if side == 'LONG':
+                                floor_price = signal_entry + min_profit
+                                target_price = (max(candidate, floor_price)
+                                                if candidate > 0 else floor_price)
+                            else:
+                                ceiling_price = signal_entry - min_profit
+                                target_price = (min(candidate, ceiling_price)
+                                                if candidate > 0 else ceiling_price)
+
+                            qty = order_mgr.round_qty(sym, qty)
+                            if qty <= 0:
+                                debug_logger.error("qty округлилось до 0, пропуск сигнала")
+                            else:
+                                order_id = order_mgr.place_market_order(
+                                    sym, open_side, qty
+                                )
+                                if not order_id:
+                                    debug_logger.error(
+                                        "Market-ордер не прошёл, сделка не открыта"
+                                    )
+                                else:
+                                    # [PATCH 37] entry = fill, пересчёт стопа и цели от fill
+                                    actual_pos = order_mgr.get_position(sym)
+                                    if actual_pos and actual_pos.get('entry_price', 0) > 0:
+                                        actual_entry = actual_pos['entry_price']
+                                        if abs(actual_entry - signal_entry) > 1e-6:
+                                            debug_logger.info(
+                                                f"entry уточнена с биржи: "
+                                                f"{signal_entry:.2f} → {actual_entry:.2f}"
                                             )
+                                        entry_price = actual_entry
+
+                                        # Стоп от фактической entry, дистанция та же
+                                        if side == 'LONG':
+                                            stop_loss = entry_price - stop_distance
+                                        else:
+                                            stop_loss = entry_price + stop_distance
+
+                                        # Цель от фактической entry
+                                        if side == 'LONG':
+                                            floor_price = entry_price + min_profit
+                                            target_price = (max(candidate, floor_price)
+                                                            if candidate > 0 else floor_price)
+                                        else:
+                                            ceiling_price = entry_price - min_profit
+                                            target_price = (min(candidate, ceiling_price)
+                                                            if candidate > 0 else ceiling_price)
+                                    else:
+                                        entry_price = signal_entry
+
+                                    stop_order_id = order_mgr.place_stop_market_order(
+                                        sym, close_side, qty, stop_loss
+                                    )
+                                    stop_ok = stop_order_id is not None
+
+                                    if not stop_ok:
+                                        debug_logger.error("Стоп-маркет не выставлен!")
+                                        if STOP_FAIL_FALLBACK_ENABLED:
+                                            debug_logger.warning(
+                                                "Fallback активен: закрываю позицию по рынку"
+                                            )
+                                            order_mgr.close_position(sym)
+                                            order_mgr.cancel_all_orders(sym)
+                                            clear_live_position()
+                                            clear_manual_target()
+                                            if tg:
+                                                await tg.send_notification(
+                                                    f"⚠️ Стоп не встал, позиция закрыта: {sym}"
+                                                )
+                                        else:
+                                            save_live_position({
+                                                'side': side,
+                                                'entry_price': entry_price,
+                                                'qty': qty,
+                                                'stop_loss': stop_loss,
+                                                'target_price': target_price,
+                                                'target_source': target_source,
+                                                'stop_ok': False,
+                                                'stop_order_id': None,
+                                                'order_id': order_id,
+                                                'opened_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                            })
+                                            debug_logger.warning(
+                                                "Позиция сохранена БЕЗ стопа (stop_ok=False)"
+                                            )
+                                            if tg:
+                                                await tg.send_notification(
+                                                    f"⚠️ {side} открыт БЕЗ стопа: {sym}\n"
+                                                    f"Вход: {entry_price:.2f}\n"
+                                                    f"Цель: {target_price:.2f} ({target_source})\n"
+                                                    f"Qty: {qty:.6f}"
+                                                )
                                     else:
                                         save_live_position({
                                             'side': side,
@@ -895,49 +931,26 @@ async def main():
                                             'stop_loss': stop_loss,
                                             'target_price': target_price,
                                             'target_source': target_source,
-                                            'stop_ok': False,
-                                            'stop_order_id': None,
+                                            'stop_ok': True,
+                                            'stop_order_id': stop_order_id,
                                             'order_id': order_id,
                                             'opened_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                         })
-                                        debug_logger.warning(
-                                            "Позиция сохранена БЕЗ стопа (stop_ok=False)"
+                                        _push_last_ts = time.time()
+                                        debug_logger.info(
+                                            f"{side} открыт: {sym} {qty:.6f} @ "
+                                            f"{entry_price:.2f}, stop={stop_loss:.2f}, "
+                                            f"target={target_price:.2f} ({target_source}), "
+                                            f"stop_ok=True"
                                         )
                                         if tg:
                                             await tg.send_notification(
-                                                f"⚠️ {side} открыт БЕЗ стопа: {sym}\n"
+                                                f"🚀 {side} открыт: {sym}\n"
                                                 f"Вход: {entry_price:.2f}\n"
+                                                f"Стоп: {stop_loss:.2f} ✅\n"
                                                 f"Цель: {target_price:.2f} ({target_source})\n"
                                                 f"Qty: {qty:.6f}"
                                             )
-                                else:
-                                    save_live_position({
-                                        'side': side,
-                                        'entry_price': entry_price,
-                                        'qty': qty,
-                                        'stop_loss': stop_loss,
-                                        'target_price': target_price,
-                                        'target_source': target_source,
-                                        'stop_ok': True,
-                                        'stop_order_id': stop_order_id,
-                                        'order_id': order_id,
-                                        'opened_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    })
-                                    _push_last_ts = time.time()
-                                    debug_logger.info(
-                                        f"{side} открыт: {sym} {qty:.6f} @ "
-                                        f"{entry_price:.2f}, stop={stop_loss:.2f}, "
-                                        f"target={target_price:.2f} ({target_source}), "
-                                        f"stop_ok=True"
-                                    )
-                                    if tg:
-                                        await tg.send_notification(
-                                            f"🚀 {side} открыт: {sym}\n"
-                                            f"Вход: {entry_price:.2f}\n"
-                                            f"Стоп: {stop_loss:.2f} ✅\n"
-                                            f"Цель: {target_price:.2f} ({target_source})\n"
-                                            f"Qty: {qty:.6f}"
-                                        )
 
                     state['long']['state'] = 'WAIT_MIN1'
                     state['long']['min1'] = state['long']['max1'] = state['long']['min2'] = None

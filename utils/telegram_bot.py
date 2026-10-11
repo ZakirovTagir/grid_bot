@@ -2,14 +2,17 @@
 utils/telegram_bot.py
 Telegram-бот для управления целями, оптимизатором и остановки.
 
-v3:
-- [PATCH 20] /close_all confirm — закрытие всех позиций по рынку.
-  Без confirm — только предупреждение.
+v4:
+- [FIX #2] /account — состояние счёта (баланс, equity, unrealized, available, margin).
+- [FIX #2] /last_trade — последняя закрытая сделка из get_closed_pnl.
+- [FIX #3] /stop <price> — переставить стоп у текущей позиции (с валидацией).
 
+v3:
+- [PATCH 20] /close_all confirm.
 v2:
-- [PATCH 3] /target применяется к ТЕКУЩЕЙ сделке.
-- [PATCH 17] /close — рыночное закрытие.
-- [PATCH 19] /show_target — показывает к текущей или следующей.
+- [PATCH 3] /target применяется к текущей сделке.
+- [PATCH 17] /close.
+- [PATCH 19] /show_target — к текущей или следующей.
 - [PATCH 27] /position.
 - [PATCH 29/30] /mute_position + /unmute_position.
 """
@@ -44,6 +47,8 @@ TELEGRAM_STATE_FILE = os.path.join(CONFIG_DIR, "telegram_state.json")
 ALLOWED_TF = {"60", "30", "15"}
 TF_LABEL = {"60": "1h", "30": "30m", "15": "15m"}
 
+SYMBOL = "BTCUSDT"
+
 
 class TelegramBot:
     def __init__(self, token: str, stop_callback=None, sync_callback=None,
@@ -77,6 +82,10 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("position", self.show_position))
         self.app.add_handler(CommandHandler("mute_position", self.mute_position))
         self.app.add_handler(CommandHandler("unmute_position", self.unmute_position))
+        # [FIX #2/#3]
+        self.app.add_handler(CommandHandler("account", self.account_info))
+        self.app.add_handler(CommandHandler("last_trade", self.last_trade))
+        self.app.add_handler(CommandHandler("stop", self.set_stop))
 
         self.params = {}
 
@@ -534,7 +543,7 @@ class TelegramBot:
             return
         await update.message.reply_text("Закрываю позицию по рынку...")
         try:
-            order_id = self.order_mgr.close_position("BTCUSDT")
+            order_id = self.order_mgr.close_position(SYMBOL)
             if order_id:
                 self._clear_live_position()
                 self._write_manual_targets({"BTCUSDT": 0.0})
@@ -548,7 +557,6 @@ class TelegramBot:
 
     async def close_all_positions_cmd(self, update: Update,
                                       context: ContextTypes.DEFAULT_TYPE):
-        """[PATCH 20] /close_all confirm — закрыть все позиции по рынку."""
         args = context.args or []
         if not args or args[0].lower() != "confirm":
             await update.message.reply_text(
@@ -607,8 +615,8 @@ class TelegramBot:
             last_price = None
             pnl = None
             if self.order_mgr is not None:
-                last_price = self.order_mgr.get_last_price("BTCUSDT")
-                pos_info = self.order_mgr.get_position("BTCUSDT")
+                last_price = self.order_mgr.get_last_price(SYMBOL)
+                pos_info = self.order_mgr.get_position(SYMBOL)
                 if pos_info is not None:
                     pnl = pos_info.get("unrealized_pnl")
 
@@ -675,6 +683,184 @@ class TelegramBot:
             await update.message.reply_text(
                 "🔊 Push по позиции включён (каждые 15 минут).")
         except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    # ------------------------------------------------------------
+    #  [FIX #2] /account
+    # ------------------------------------------------------------
+    async def account_info(self, update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
+        if self.order_mgr is None:
+            await update.message.reply_text("❌ order_mgr не подключён.")
+            return
+        try:
+            acc = self.order_mgr.get_account_info()
+            if acc is None:
+                await update.message.reply_text(
+                    "❌ Не удалось получить данные аккаунта с биржи.")
+                return
+
+            lines = [
+                "💰 BTCUSDT Аккаунт",
+                f"Баланс:     {acc['wallet_balance']:.2f} USDT",
+                f"Equity:     {acc['equity']:.2f} USDT",
+                f"Unrealized: {acc['unrealized_pnl']:+.2f} USDT",
+                f"Свободно:   {acc['available']:.2f} USDT",
+                f"Маржа:      {acc['initial_margin']:.2f} USDT",
+            ]
+
+            live_pos = self._read_live_position()
+            if live_pos is not None:
+                side = live_pos.get("side", "?")
+                qty = float(live_pos.get("qty", 0))
+                entry = float(live_pos.get("entry_price", 0))
+                pos_value = qty * entry
+                lines.append("")
+                lines.append(f"Позиция: {side} {qty} ({pos_value:.2f} USDT)")
+
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    # ------------------------------------------------------------
+    #  [FIX #2] /last_trade
+    # ------------------------------------------------------------
+    async def last_trade(self, update: Update,
+                         context: ContextTypes.DEFAULT_TYPE):
+        if self.order_mgr is None:
+            await update.message.reply_text("❌ order_mgr не подключён.")
+            return
+        try:
+            closed = self.order_mgr.get_closed_pnl(SYMBOL)
+            if closed is None:
+                await update.message.reply_text(
+                    "Нет данных о последней закрытой сделке.")
+                return
+
+            side = closed["side"]
+            entry = closed["avg_entry"]
+            exit_ = closed["avg_exit"]
+            qty = closed["qty"]
+            pnl = closed["closed_pnl"]
+
+            closed_at = closed.get("closed_at", "")
+            try:
+                if closed_at:
+                    ts = datetime.fromtimestamp(int(closed_at) / 1000)
+                    closed_at_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    closed_at_str = "?"
+            except Exception:
+                closed_at_str = str(closed_at)
+
+            if pnl >= 0:
+                head = f"📊 Последняя сделка: {side} {SYMBOL} (ПЛЮС)"
+            else:
+                head = f"📊 Последняя сделка: {side} {SYMBOL} (МИНУС)"
+
+            lines = [
+                head,
+                f"Вход:   {entry:.2f}",
+                f"Выход:  {exit_:.2f}",
+                f"Qty:    {qty}",
+                f"PnL:    {pnl:+.2f} USDT",
+                f"Закрыта: {closed_at_str}",
+            ]
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    # ------------------------------------------------------------
+    #  [FIX #3] /stop <price>
+    # ------------------------------------------------------------
+    async def set_stop(self, update: Update,
+                       context: ContextTypes.DEFAULT_TYPE):
+        if self.order_mgr is None:
+            await update.message.reply_text("❌ order_mgr не подключён.")
+            return
+
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "Формат: /stop <price>\n"
+                "Пример: /stop 82400\n"
+                "Переставит стоп у текущей открытой позиции.")
+            return
+
+        try:
+            new_stop = float(args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Цена должна быть числом.")
+            return
+
+        live_pos = self._read_live_position()
+        if live_pos is None:
+            await update.message.reply_text("Нет открытой позиции.")
+            return
+
+        side = live_pos.get("side")
+        qty = float(live_pos.get("qty", 0))
+        old_stop = float(live_pos.get("stop_loss", 0))
+        old_stop_ok = live_pos.get("stop_ok", None)
+        old_stop_order_id = live_pos.get("stop_order_id")
+
+        last_price = self.order_mgr.get_last_price(SYMBOL)
+        if last_price is None:
+            await update.message.reply_text(
+                "❌ Не удалось получить текущую цену с биржи.")
+            return
+
+        # Валидация стороны
+        if side == "LONG":
+            if new_stop >= last_price:
+                await update.message.reply_text(
+                    f"❌ Для LONG стоп должен быть НИЖЕ текущей цены.\n"
+                    f"Текущая цена: {last_price:.2f}\n"
+                    f"Указанный стоп: {new_stop:.2f}")
+                return
+            close_side = "Sell"
+        else:  # SHORT
+            if new_stop <= last_price:
+                await update.message.reply_text(
+                    f"❌ Для SHORT стоп должен быть ВЫШЕ текущей цены.\n"
+                    f"Текущая цена: {last_price:.2f}\n"
+                    f"Указанный стоп: {new_stop:.2f}")
+                return
+            close_side = "Buy"
+
+        await update.message.reply_text(
+            f"Переставляю стоп: {old_stop:.2f} → {new_stop:.2f}...")
+
+        try:
+            # 1. Отменить старый стоп-ордер (если был выставлен на бирже)
+            if old_stop_ok and old_stop_order_id:
+                cancel_ok = self.order_mgr.cancel_order(SYMBOL, old_stop_order_id)
+                if not cancel_ok:
+                    logger.warning(
+                        f"cancel_order {old_stop_order_id} вернул False, продолжаю"
+                    )
+
+            # 2. Выставить новый
+            new_order_id = self.order_mgr.place_stop_market_order(
+                SYMBOL, close_side, qty, new_stop
+            )
+            if not new_order_id:
+                await update.message.reply_text(
+                    "❌ Не удалось выставить новый стоп (см. debug.log).\n"
+                    "Старый стоп, возможно, уже отменён — проверь /position.")
+                return
+
+            # 3. Обновить live_position.json
+            live_pos["stop_loss"] = new_stop
+            live_pos["stop_order_id"] = new_order_id
+            live_pos["stop_ok"] = True
+            self._write_live_position(live_pos)
+
+            await update.message.reply_text(
+                f"✅ Стоп переставлен: {old_stop:.2f} → {new_stop:.2f}\n"
+                f"order_id: {new_order_id}")
+        except Exception as e:
+            logger.error(f"set_stop failed: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     # ------------------------------------------------------------

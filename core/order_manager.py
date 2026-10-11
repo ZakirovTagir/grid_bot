@@ -546,3 +546,59 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Исключение get_candles: {e}")
             return []
+    # ------------------------------------------------------------
+    #  Комиссии биржи
+    # ------------------------------------------------------------
+    def get_taker_fee(self, symbol: str) -> float:
+        """
+        Возвращает актуальную taker-комиссию для символа.
+        Bybit: GET /v5/account/fee-rate?category=linear&symbol=BTCUSDT
+        Возвращает долю (например, 0.00055 = 0.055%).
+        Fallback: 0.00055, если API не ответил.
+        """
+        try:
+            resp = self.session.get_fee_rates(
+                category=CATEGORY, symbol=symbol,
+            )
+            if resp.get("retCode") == 0:
+                data = resp["result"]["list"]
+                if data:
+                    rate = float(data[0].get("takerFeeRate", 0.00055))
+                    logger.info(f"{symbol}: takerFeeRate = {rate}")
+                    return rate
+            logger.warning(
+                f"get_fee_rates {symbol} пусто или ошибка, "
+                f"использую fallback 0.00055"
+            )
+        except Exception as e:
+            logger.error(
+                f"Исключение get_fee_rates {symbol}: {e}, fallback 0.00055"
+            )
+    def get_account_info(self) -> dict | None:
+        """
+        Расширенная информация по UNIFIED аккаунту.
+        {'wallet_balance': float, 'equity': float, 'available': float,
+         'initial_margin': float, 'unrealized_pnl': float}
+        """
+        try:
+            resp = self.session.get_wallet_balance(accountType="UNIFIED")
+            if resp.get("retCode") != 0:
+                logger.error(f"get_account_info: {resp}")
+                return None
+            account = resp["result"]["list"][0]
+            usdt_coin = None
+            for coin in account.get("coin", []):
+                if coin["coin"] == "USDT":
+                    usdt_coin = coin
+                    break
+            return {
+                "wallet_balance": float(account.get("totalWalletBalance", 0) or 0),
+                "equity": float(account.get("totalEquity", 0) or 0),
+                "available": float(account.get("totalAvailableBalance", 0) or 0),
+                "initial_margin": float(account.get("totalInitialMargin", 0) or 0),
+                "unrealized_pnl": float(usdt_coin.get("unrealisedPnl", 0) or 0) if usdt_coin else 0.0,
+            }
+        except Exception as e:
+            logger.error(f"Исключение get_account_info: {e}")
+            return None
+        return 0.00055
