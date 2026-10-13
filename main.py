@@ -494,6 +494,11 @@ async def main():
 
     # [FIX #1] taker_fee — получаем с биржи один раз
     taker_fee = order_mgr.get_taker_fee(sym)
+    if not taker_fee or taker_fee <= 0:
+        debug_logger.warning(
+            f"taker_fee вернул {taker_fee}, использую fallback 0.00055"
+        )
+        taker_fee = 0.00055
     debug_logger.info(f"taker_fee для {sym}: {taker_fee}")
 
     # [PATCH 5] Reconciliation при старте
