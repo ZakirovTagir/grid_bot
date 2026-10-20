@@ -2,82 +2,41 @@
 find_swing_points.py
 Бэктест стратегии на основе свинг-точек.
 
-v8.1:
-- [FIX] params['MAX_LOSS_PER_TRADE'] теперь ЗАПИСЫВАЕТСЯ в рантайме
-  (round(max_loss_usdt, 2)), как в main.py v10. Симметрия с live.
-  В DEFAULT_PARAMS 8.0 — справочный placeholder.
-
-v8 (синхронизация с main.py v10 — [FIX #1]):
-- Новая логика sizing: position-first, не risk-first.
-    position_value = balance × MAX_POSITION_PERCENT / 100
-    qty = position_value / entry_price (floor до 0.001)
-    max_loss_usdt = position_value × MAX_STOP_DISTANCE_PERCENT / 100
-    commissions = position_value × TAKER_FEE × 2
-    price_loss = max_loss_usdt − commissions − 10.0 (буфер)
-    stop_distance = price_loss / qty
-    stop_loss = entry ± stop_distance
-  Если price_loss <= 0 — сигнал пропускается.
-- TAKER_FEE = 0.00055 (жёстко, ставка Bybit linear taker).
-- channel_width / 2.0 в check_entry оставлен для лога.
-- MIN_POSITION_USDT оставлен для безопасности.
-
-v7:
-- MIN_TARGET_PROFIT как floor.
-- Цель НИКОГДА не 0.
-
-v6 (упрощение группы C):
-- Убраны: BREAKEVEN_*, TRAILING_*, двухступенчатая защита.
-- Цель по формуле: LONG: min2 + (max1-min1)/2, SHORT: max2 - (max1-min1)/2.
-- Ручная цель через MANUAL_TARGET_PRICE.
+v9:
+- [FIX #6] Добавлен MAX_STRUCTURE_MOVE_PCT. Если импульс > 1.5%,
+  max1 сбрасывается.
+- Синхронизация логики с core/swing_finder.py v4.
 """
-
 import math
 import pandas as pd
 import sys
 from typing import Dict, Any, List, Optional
 
-
-# ============================================================
-#  Дефолтные параметры (актуальные значения из pairs.yaml)
-# ============================================================
 DEFAULT_PARAMS = {
-    # --- группа A: структура ---
     'N': 7,
     'MIN_BODY_RATIO': 0.3,
     'DELTA_PRICE': 117.53,
     'MIN_DISTANCE_BARS': 10,
     'MAX_DELTA_EXTREMES': 4.0,
-    # --- группа B: вход ---
     'ENTRY_TOLERANCE_USD': 68.7,
     'MIN_BARS_AFTER_POINT2': 3,
     'MAX_BARS_AFTER_POINT2': 10,
-    # --- группа C: управление ---
-    # MAX_LOSS_PER_TRADE — вычисляется в рантайме (8.0 — справочный placeholder)
+    'MAX_STRUCTURE_MOVE_PCT': 1.5,       # [FIX #6]
     'MAX_LOSS_PER_TRADE': 8.0,
     'MAX_STOP_DISTANCE_PERCENT': 2.5,
     'MAX_POSITION_PERCENT': 95.0,
     'MIN_POSITION_USDT': 10.0,
-    'MIN_TARGET_PROFIT': 200.0,         # USDT: минимальный профит до цели (FLOOR)
-    'TARGET_BARS_DELAY': 3,             # баров: задержка активации цели
-    'MANUAL_TARGET_PRICE': 0.0,         # 0 = формула; >0 = ручная цель
+    'MIN_TARGET_PROFIT': 200.0,
+    'TARGET_BARS_DELAY': 3,
+    'MANUAL_TARGET_PRICE': 0.0,
 }
 
-# Taker-комиссия Bybit linear (жёстко, ставка 0.055%)
 TAKER_FEE = 0.00055
-
-# Буфер проскальзывания для стопа (USDT, инлайн)
 SLIPPAGE_BUFFER_USDT = 10.0
-
-# Шаг qty для BTCUSDT (floor)
 QTY_STEP = 0.001
-
 INPUT_CSV = "data/historical/BTCUSDT_15.csv"
 OUTPUT_LOG = "swing_points_log.txt"
 
-
-# ============================================================
-#  Вспомогательные
-# ============================================================
 def is_noisy(row, min_body_ratio: float) -> bool:
     high = row['high']
     low = row['low']
@@ -89,14 +48,12 @@ def is_noisy(row, min_body_ratio: float) -> bool:
     body = abs(close - open_)
     return (body / candle_range) < min_body_ratio
 
-
 def get_block_non_noisy(block, min_body_ratio: float):
     non_noisy = []
     for idx, row in block.iterrows():
         if not is_noisy(row, min_body_ratio):
             non_noisy.append((idx, row))
     return non_noisy
-
 
 def get_block_extremes(non_noisy):
     if not non_noisy:
@@ -105,11 +62,9 @@ def get_block_extremes(non_noisy):
     max_row = max(non_noisy, key=lambda x: (x[1]['high'], -x[0]))
     return (min_row[1]['low'], min_row[0]), (max_row[1]['high'], max_row[0])
 
-
 def candle_body(df: pd.DataFrame, idx: int) -> float:
     row = df.iloc[idx]
     return abs(float(row['close']) - float(row['open']))
-
 
 def avg_body_between(df: pd.DataFrame, idx_start: int, idx_end: int) -> float:
     if idx_end < idx_start:
@@ -119,9 +74,7 @@ def avg_body_between(df: pd.DataFrame, idx_start: int, idx_end: int) -> float:
         return 0.0
     return sum(bodies) / len(bodies)
 
-
-def check_body_spike(df: pd.DataFrame, idx_point1: int, idx_point2: int,
-                     k: float) -> bool:
+def check_body_spike(df: pd.DataFrame, idx_point1: int, idx_point2: int, k: float) -> bool:
     if k <= 0:
         return False
     body_p2 = candle_body(df, idx_point2)
@@ -130,14 +83,7 @@ def check_body_spike(df: pd.DataFrame, idx_point1: int, idx_point2: int,
         return False
     return (body_p2 / avg_body) > k
 
-
-def calc_structural_target(side: str, min1_price: float,
-                           max1_price: float, min2_price: float,
-                           max2_price: float) -> float:
-    """
-    Формула цели. Возвращает СЫРОЕ значение.
-    Если impulse <= 0 — вернёт 0.0 (клэмпинг делает вызывающий код).
-    """
+def calc_structural_target(side: str, min1_price: float, max1_price: float, min2_price: float, max2_price: float) -> float:
     impulse = max1_price - min1_price
     if impulse <= 0:
         return 0.0
@@ -146,9 +92,7 @@ def calc_structural_target(side: str, min1_price: float,
     else:
         return max2_price - impulse / 2.0
 
-
 def floor_qty(qty: float, step: float = QTY_STEP) -> float:
-    """Floor qty до шага биржи (как в order_manager.round_qty)."""
     if step <= 0:
         return qty
     precision = 0
@@ -161,21 +105,11 @@ def floor_qty(qty: float, step: float = QTY_STEP) -> float:
     return round(floored, precision)
 
 
-# ============================================================
-#  LongFinder
-# ============================================================
 class LongFinder:
     def __init__(self, df, params: Dict[str, Any]):
         self.df = df
         self.params = params
-        self.state = "WAIT_MIN1"
-        self.min1_price = None
-        self.min1_idx = None
-        self.max1_price = None
-        self.max1_idx = None
-        self.min2_price = None
-        self.min2_idx = None
-        self.pending_trend = None
+        self.reset()
 
     def reset(self):
         self.state = "WAIT_MIN1"
@@ -192,6 +126,7 @@ class LongFinder:
         delta_price = self.params['DELTA_PRICE']
         min_distance = self.params['MIN_DISTANCE_BARS']
         max_delta_k = self.params['MAX_DELTA_EXTREMES']
+        max_struct_pct = self.params.get('MAX_STRUCTURE_MOVE_PCT', 1.5) / 100.0
 
         non_noisy = get_block_non_noisy(block, min_body_ratio)
         if not non_noisy:
@@ -207,11 +142,20 @@ class LongFinder:
             else:
                 self.reset()
         elif self.state == "WAIT_MIN2":
-            if H_price > self.max1_price:
-                self.max1_price, self.max1_idx = H_price, H_idx
+            if self.max1_price is None:
+                if H_price > self.min1_price:
+                    self.max1_price, self.max1_idx = H_price, H_idx
+            elif H_price > self.max1_price:
+                impulse_pct = (H_price - self.min1_price) / self.min1_price
+                if impulse_pct > max_struct_pct:
+                    self.max1_price = None
+                    self.max1_idx = None
+                else:
+                    self.max1_price, self.max1_idx = H_price, H_idx
+
             if L_price > self.min1_price:
                 distance = L_idx - self.min1_idx
-                if distance >= min_distance and L_idx > self.max1_idx:
+                if distance >= min_distance and L_idx > (self.max1_idx if self.max1_idx is not None else 0):
                     if check_body_spike(self.df, self.min1_idx, L_idx, max_delta_k):
                         self.reset()
                         return
@@ -265,21 +209,11 @@ class LongFinder:
         return None
 
 
-# ============================================================
-#  ShortFinder
-# ============================================================
 class ShortFinder:
     def __init__(self, df, params: Dict[str, Any]):
         self.df = df
         self.params = params
-        self.state = "WAIT_MAX1"
-        self.max1_price = None
-        self.max1_idx = None
-        self.min1_price = None
-        self.min1_idx = None
-        self.max2_price = None
-        self.max2_idx = None
-        self.pending_trend = None
+        self.reset()
 
     def reset(self):
         self.state = "WAIT_MAX1"
@@ -296,6 +230,7 @@ class ShortFinder:
         delta_price = self.params['DELTA_PRICE']
         min_distance = self.params['MIN_DISTANCE_BARS']
         max_delta_k = self.params['MAX_DELTA_EXTREMES']
+        max_struct_pct = self.params.get('MAX_STRUCTURE_MOVE_PCT', 1.5) / 100.0
 
         non_noisy = get_block_non_noisy(block, min_body_ratio)
         if not non_noisy:
@@ -311,11 +246,20 @@ class ShortFinder:
             else:
                 self.reset()
         elif self.state == "WAIT_MAX2":
-            if L_price < self.min1_price:
-                self.min1_price, self.min1_idx = L_price, L_idx
+            if self.min1_price is None:
+                if L_price < self.max1_price:
+                    self.min1_price, self.min1_idx = L_price, L_idx
+            elif L_price < self.min1_price:
+                impulse_pct = (self.max1_price - L_price) / self.max1_price
+                if impulse_pct > max_struct_pct:
+                    self.min1_price = None
+                    self.min1_idx = None
+                else:
+                    self.min1_price, self.min1_idx = L_price, L_idx
+
             if H_price < self.max1_price:
                 distance = H_idx - self.max1_idx
-                if distance >= min_distance and H_idx > self.min1_idx:
+                if distance >= min_distance and H_idx > (self.min1_idx if self.min1_idx is not None else 0):
                     if check_body_spike(self.df, self.max1_idx, H_idx, max_delta_k):
                         self.reset()
                         return
@@ -368,10 +312,6 @@ class ShortFinder:
             }
         return None
 
-
-# ============================================================
-#  Scan mode
-# ============================================================
 def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any], callback=None) -> None:
     N = params['N']
     long_finder = LongFinder(df, params)
@@ -404,10 +344,6 @@ def scan_mode_pass(df: pd.DataFrame, params: Dict[str, Any], callback=None) -> N
             buffer = []
             block_start = i + 1
 
-
-# ============================================================
-#  Сборщики статистики (для оптимизатора)
-# ============================================================
 def collect_block_amplitudes(df: pd.DataFrame, n: int = 7) -> List[float]:
     amplitudes = []
     total = len(df)
@@ -416,7 +352,6 @@ def collect_block_amplitudes(df: pd.DataFrame, n: int = 7) -> List[float]:
         amp = float(block['high'].max() - block['low'].min())
         amplitudes.append(amp)
     return amplitudes
-
 
 def collect_point_distances(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[int]:
     params = dict(base_params)
@@ -428,7 +363,6 @@ def collect_point_distances(df: pd.DataFrame, base_params: Dict[str, Any]) -> Li
     params['MAX_BARS_AFTER_POINT2'] = 10**9
 
     distances = []
-
     def cb(direction, finder):
         if direction == "LONG":
             distances.append(int(finder.min2_idx - finder.min1_idx))
@@ -437,7 +371,6 @@ def collect_point_distances(df: pd.DataFrame, base_params: Dict[str, Any]) -> Li
 
     scan_mode_pass(df, params, callback=cb)
     return distances
-
 
 def collect_body_ratios(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[float]:
     params = dict(base_params)
@@ -449,7 +382,6 @@ def collect_body_ratios(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[f
     params['MAX_BARS_AFTER_POINT2'] = 10**9
 
     ratios = []
-
     def cb(direction, finder):
         if direction == "LONG":
             idx1, idx2 = finder.min1_idx, finder.min2_idx
@@ -464,7 +396,6 @@ def collect_body_ratios(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[f
     scan_mode_pass(df, params, callback=cb)
     return ratios
 
-
 def collect_line_gaps(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[float]:
     params = dict(base_params)
     params['DELTA_PRICE'] = 0
@@ -472,7 +403,6 @@ def collect_line_gaps(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[flo
     params['MAX_DELTA_EXTREMES'] = 0
 
     gaps = []
-
     def cb(direction, finder):
         if direction == "LONG":
             idx_start = finder.min2_idx + 1
@@ -504,16 +434,7 @@ def collect_line_gaps(df: pd.DataFrame, base_params: Dict[str, Any]) -> List[flo
     scan_mode_pass(df, params, callback=cb)
     return gaps
 
-
-# ============================================================
-#  Ядро бэктеста
-# ============================================================
-def run_backtest(params: Dict[str, Any],
-                 df: pd.DataFrame,
-                 initial_balance: float = 1000.0,
-                 save_events_path: Optional[str] = None,
-                 verbose: bool = False) -> Dict[str, Any]:
-
+def run_backtest(params: Dict[str, Any], df: pd.DataFrame, initial_balance: float = 1000.0, save_events_path: Optional[str] = None, verbose: bool = False) -> Dict[str, Any]:
     N = params['N']
     MAX_STOP_DISTANCE_PERCENT = params['MAX_STOP_DISTANCE_PERCENT']
     MAX_POSITION_PERCENT = params['MAX_POSITION_PERCENT']
@@ -549,7 +470,6 @@ def run_backtest(params: Dict[str, Any],
             high = current_candle['high']
             low = current_candle['low']
 
-            # ---- 1. Проверка стопа ----
             stop_hit = False
             if side == 'LONG' and low <= stop_loss:
                 stop_hit = True
@@ -577,7 +497,6 @@ def run_backtest(params: Dict[str, Any],
                 i += 1
                 continue
 
-            # ---- 2. Проверка цели ----
             if target_price > 0 and position['bars_since_entry'] >= TARGET_BARS_DELAY:
                 target_hit = False
                 if side == 'LONG' and high >= target_price:
@@ -621,19 +540,15 @@ def run_backtest(params: Dict[str, Any],
                     signal_entry = signal['entry_price']
                     side = signal['type']
 
-                    # ============================================================
-                    # [FIX #1] Новая логика sizing: position-first
-                    # ============================================================
                     position_value = balance * MAX_POSITION_PERCENT / 100
                     max_loss_usdt = position_value * MAX_STOP_DISTANCE_PERCENT / 100
-                    params['MAX_LOSS_PER_TRADE'] = round(max_loss_usdt, 2)   # [FIX] запись в params
+                    params['MAX_LOSS_PER_TRADE'] = round(max_loss_usdt, 2)
                     commissions = position_value * TAKER_FEE * 2
                     price_loss = max_loss_usdt - commissions - SLIPPAGE_BUFFER_USDT
 
                     if price_loss <= 0:
                         events.append({
-                            'type': 'entry_cancelled',
-                            'trend': side,
+                            'type': 'entry_cancelled', 'trend': side,
                             'details': (f"price_loss={price_loss:.2f} <= 0 "
                                         f"(pos={position_value:.2f} max_loss={max_loss_usdt:.2f} "
                                         f"comm={commissions:.2f})")
@@ -643,10 +558,8 @@ def run_backtest(params: Dict[str, Any],
 
                     if position_value < MIN_POSITION_USDT:
                         events.append({
-                            'type': 'entry_cancelled',
-                            'trend': side,
-                            'details': (f"малая позиция ({position_value:.2f} "
-                                        f"< {MIN_POSITION_USDT})")
+                            'type': 'entry_cancelled', 'trend': side,
+                            'details': (f"малая позиция ({position_value:.2f} < {MIN_POSITION_USDT})")
                         })
                         finder.reset()
                         continue
@@ -656,8 +569,7 @@ def run_backtest(params: Dict[str, Any],
 
                     if qty <= 0:
                         events.append({
-                            'type': 'entry_cancelled',
-                            'trend': side,
+                            'type': 'entry_cancelled', 'trend': side,
                             'details': f"qty={qty} после floor, пропуск"
                         })
                         finder.reset()
@@ -670,7 +582,6 @@ def run_backtest(params: Dict[str, Any],
                     else:
                         stop_loss = signal_entry + stop_distance
 
-                    # ---- Целевая цена ----
                     min1_p = signal['min1'][1]
                     max1_p = signal['max1'][1]
                     if side == 'LONG':
@@ -683,20 +594,15 @@ def run_backtest(params: Dict[str, Any],
                     if MANUAL_TARGET_PRICE > 0:
                         candidate = MANUAL_TARGET_PRICE
                     else:
-                        candidate = calc_structural_target(
-                            side, min1_p, max1_p, min2_p, max2_p
-                        )
+                        candidate = calc_structural_target(side, min1_p, max1_p, min2_p, max2_p)
 
                     if side == 'LONG':
                         floor_price = signal_entry + MIN_TARGET_PROFIT
-                        target_price = (max(candidate, floor_price)
-                                        if candidate > 0 else floor_price)
+                        target_price = (max(candidate, floor_price) if candidate > 0 else floor_price)
                     else:
                         ceiling_price = signal_entry - MIN_TARGET_PROFIT
-                        target_price = (min(candidate, ceiling_price)
-                                        if candidate > 0 else ceiling_price)
+                        target_price = (min(candidate, ceiling_price) if candidate > 0 else ceiling_price)
 
-                    # ---- Баланс при открытии ----
                     commission_open = position_value * TAKER_FEE
                     balance_before = balance
                     if side == 'LONG':
@@ -705,32 +611,21 @@ def run_backtest(params: Dict[str, Any],
                         balance += position_value - commission_open
 
                     position = {
-                        'side': side,
-                        'entry_price': signal_entry,
-                        'qty': qty,
-                        'stop_loss': stop_loss,
-                        'target_price': target_price,
-                        'balance_before': balance_before,
-                        'entry_idx': i,
-                        'bars_since_entry': 0,
+                        'side': side, 'entry_price': signal_entry, 'qty': qty,
+                        'stop_loss': stop_loss, 'target_price': target_price,
+                        'balance_before': balance_before, 'entry_idx': i, 'bars_since_entry': 0,
                     }
 
                     trend_points = finder.pending_trend
                     if trend_points:
                         if trend_points['type'] == 'LONG':
-                            events.append({'type': 'мин1', 'idx': trend_points['min1'][0],
-                                           'price': trend_points['min1'][1], 'trend': 'LONG'})
-                            events.append({'type': 'макс1', 'idx': trend_points['max1'][0],
-                                           'price': trend_points['max1'][1], 'trend': 'LONG'})
-                            events.append({'type': 'мин2', 'idx': trend_points['min2'][0],
-                                           'price': trend_points['min2'][1], 'trend': 'LONG'})
+                            events.append({'type': 'мин1', 'idx': trend_points['min1'][0], 'price': trend_points['min1'][1], 'trend': 'LONG'})
+                            events.append({'type': 'макс1', 'idx': trend_points['max1'][0], 'price': trend_points['max1'][1], 'trend': 'LONG'})
+                            events.append({'type': 'мин2', 'idx': trend_points['min2'][0], 'price': trend_points['min2'][1], 'trend': 'LONG'})
                         else:
-                            events.append({'type': 'макс1', 'idx': trend_points['max1'][0],
-                                           'price': trend_points['max1'][1], 'trend': 'SHORT'})
-                            events.append({'type': 'мин1', 'idx': trend_points['min1'][0],
-                                           'price': trend_points['min1'][1], 'trend': 'SHORT'})
-                            events.append({'type': 'макс2', 'idx': trend_points['max2'][0],
-                                           'price': trend_points['max2'][1], 'trend': 'SHORT'})
+                            events.append({'type': 'макс1', 'idx': trend_points['max1'][0], 'price': trend_points['max1'][1], 'trend': 'SHORT'})
+                            events.append({'type': 'мин1', 'idx': trend_points['min1'][0], 'price': trend_points['min1'][1], 'trend': 'SHORT'})
+                            events.append({'type': 'макс2', 'idx': trend_points['max2'][0], 'price': trend_points['max2'][1], 'trend': 'SHORT'})
 
                     events.append({
                         'type': 'entry', 'idx': i, 'price': signal_entry, 'trend': side,
@@ -747,7 +642,6 @@ def run_backtest(params: Dict[str, Any],
 
         i += 1
 
-    # ---- Закрытие последней позиции по концу периода ----
     if position is not None:
         last_price = df.iloc[-1]['close']
         exit_price = last_price
@@ -760,13 +654,11 @@ def run_backtest(params: Dict[str, Any],
             balance -= qty * exit_price + commission
         pnl_total = balance - position['balance_before']
         events.append({
-            'type': 'exit', 'idx': len(df) - 1, 'price': exit_price,
-            'trend': position['side'],
+            'type': 'exit', 'idx': len(df) - 1, 'price': exit_price, 'trend': position['side'],
             'details': f"reason: {reason}, PnL:{pnl_total:.2f} USDT, баланс:{balance:.2f}"
         })
         equity_curve.append(balance)
 
-    # ---- Метрики ----
     total_trades = sum(1 for e in events if e['type'] == 'exit')
     profitable = 0
     losing = 0
@@ -800,15 +692,10 @@ def run_backtest(params: Dict[str, Any],
                     max_dd_pct = dd
 
     result = {
-        'final_balance': round(balance, 2),
-        'net_pnl': round(net_pnl, 2),
-        'num_trades': total_trades,
-        'winning_trades': profitable,
-        'losing_trades': losing,
-        'win_rate': round(win_rate, 4),
-        'max_drawdown_pct': round(max_dd_pct, 2),
-        'events': events,
-        'equity_curve': equity_curve,
+        'final_balance': round(balance, 2), 'net_pnl': round(net_pnl, 2),
+        'num_trades': total_trades, 'winning_trades': profitable, 'losing_trades': losing,
+        'win_rate': round(win_rate, 4), 'max_drawdown_pct': round(max_dd_pct, 2),
+        'events': events, 'equity_curve': equity_curve,
     }
 
     if verbose:
@@ -843,7 +730,6 @@ def save_events(events, df, path):
                 f.write(f",{ev['type']},,,{ev.get('details', '')}\n")
     print(f"Лог сохранён в {path}")
 
-
 def main():
     try:
         df = pd.read_csv(INPUT_CSV)
@@ -856,14 +742,10 @@ def main():
         sys.exit(1)
 
     result = run_backtest(
-        params=DEFAULT_PARAMS,
-        df=df,
-        initial_balance=1000.0,
-        save_events_path=OUTPUT_LOG,
-        verbose=True,
+        params=DEFAULT_PARAMS, df=df, initial_balance=1000.0,
+        save_events_path=OUTPUT_LOG, verbose=True,
     )
     return result
-
 
 if __name__ == "__main__":
     main()

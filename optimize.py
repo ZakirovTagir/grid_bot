@@ -17,12 +17,11 @@ optimize.py — калькулятор параметров стратегии �
 - отправляет TG-уведомления (старт и финал);
 - lock-файл для защиты от параллельных запусков.
 
-v2:
-- _to_native_types: numpy-скаляры → Python float/int/bool перед yaml-dump,
-  чтобы в pairs.yaml не попадали теги tag:yaml.org,2002:python/object.
+v3:
+- [FIX #6] Добавлен параметр MAX_STRUCTURE_MOVE_PCT в кандидата и отчёт.
+- _to_native_types для numpy-скаляров.
 - write_candidate использует yaml.safe_dump.
 """
-
 import os
 import sys
 import io
@@ -55,7 +54,6 @@ from find_swing_points import (
 from scripts.fetch_history import fetch_history
 
 load_dotenv(os.path.join(BASE_DIR, ".env"))
-
 
 # ============================================================
 #  Константы
@@ -90,6 +88,7 @@ HARD_MIN_BODY_RATIO = 0.3
 HARD_MAX_DELTA_EXTREMES = 4.0
 HARD_MIN_BARS_AFTER = 3
 HARD_MAX_BARS_AFTER = 10
+HARD_MAX_STRUCTURE_MOVE_PCT = 1.5
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -179,7 +178,6 @@ def load_df(csv_path: str, days_back: int) -> pd.DataFrame:
 
 def trimmed_percentile(values: List[float], pct: float,
                        trim_pct: float = TRIM_PCT) -> float:
-    """Trimmed percentile: отбрасываем по trim_pct с каждой стороны, берём pct."""
     if not values:
         return 0.0
     arr = np.array(values, dtype=float)
@@ -209,11 +207,6 @@ def trimmed_median(values: List[float],
 
 
 def _to_native_types(obj):
-    """
-    Рекурсивно приводит numpy-скаляры к нативным Python-типам,
-    чтобы yaml.safe_dump мог их сериализовать без тегов
-    tag:yaml.org,2002:python/object.
-    """
     if isinstance(obj, dict):
         return {k: _to_native_types(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -231,7 +224,6 @@ def _to_native_types(obj):
 #  Расчёт параметров
 # ============================================================
 def calc_delta_price(tf: str) -> float:
-    """Медиана амплитуд блоков (30 дней) × 0.25."""
     print(f"\n[CALC] DELTA_PRICE — окно {DAYS_DELTA} дней", flush=True)
     csv_path = ensure_csv(tf, DAYS_DISTANCE)
     df = load_df(csv_path, DAYS_DELTA)
@@ -247,7 +239,6 @@ def calc_delta_price(tf: str) -> float:
 
 
 def calc_min_distance_bars(tf: str) -> int:
-    """25-й процентиль расстояний между точками (90 дней)."""
     print(f"\n[CALC] MIN_DISTANCE_BARS — окно {DAYS_DISTANCE} дней", flush=True)
     csv_path = ensure_csv(tf, DAYS_DISTANCE)
     df = load_df(csv_path, DAYS_DISTANCE)
@@ -266,7 +257,6 @@ def calc_min_distance_bars(tf: str) -> int:
 
 
 def calc_entry_tolerance(tf: str) -> float:
-    """Медиана недоходов до линии (30 дней) × 1.5."""
     print(f"\n[CALC] ENTRY_TOLERANCE_USD — окно {DAYS_TOLERANCE} дней", flush=True)
     csv_path = ensure_csv(tf, DAYS_DISTANCE)
     df = load_df(csv_path, DAYS_TOLERANCE)
@@ -293,6 +283,7 @@ def calc_entry_tolerance(tf: str) -> float:
 PARAM_KEYS_ORDER = [
     "N", "MIN_BODY_RATIO", "DELTA_PRICE", "MIN_DISTANCE_BARS", "MAX_DELTA_EXTREMES",
     "ENTRY_TOLERANCE_USD", "MIN_BARS_AFTER_POINT2", "MAX_BARS_AFTER_POINT2",
+    "MAX_STRUCTURE_MOVE_PCT",
 ]
 
 
@@ -312,7 +303,6 @@ def write_candidate(tf: str, new_params: Dict[str, Any], metrics: Dict) -> str:
         "max_drawdown_pct": metrics["max_drawdown_pct"],
     }
     out_path = os.path.join(CONFIG_DIR, f"pairs_candidate_{tf}m.yaml")
-    # numpy → нативные типы перед записью
     cfg = _to_native_types(cfg)
     with open(out_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
@@ -412,6 +402,7 @@ def run_calc(tf: str):
         'ENTRY_TOLERANCE_USD': new_tolerance,
         'MIN_BARS_AFTER_POINT2': HARD_MIN_BARS_AFTER,
         'MAX_BARS_AFTER_POINT2': HARD_MAX_BARS_AFTER,
+        'MAX_STRUCTURE_MOVE_PCT': HARD_MAX_STRUCTURE_MOVE_PCT,
     }
 
     print(f"\n=== РАСЧЁТ ЗАВЕРШЁН за {time.time()-t_start:.1f} сек ===", flush=True)
@@ -429,7 +420,6 @@ def run_calc(tf: str):
     with contextlib.redirect_stdout(buf):
         metrics = run_backtest(params, df, initial_balance=1000.0, verbose=False)
 
-    # метрики могут содержать numpy-типы — для отчёта берём Python-числа
     metrics_native = _to_native_types(metrics)
 
     print(f"  net_pnl: {metrics_native['net_pnl']} USDT", flush=True)
