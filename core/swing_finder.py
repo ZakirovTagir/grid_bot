@@ -3,9 +3,11 @@ core/swing_finder.py
 Процедурный поиск свинг-точек с детальным логированием.
 
 v4:
-- [PATCH 15] Лог при отказе кандидата в мин2/макс2 показывает обе проверки:
-  distance >= min_distance и idx > ref_idx. Раньше писалась только дистанция,
-  что путало (писало «дистанция N», хотя N проходило, а валился idx).
+- [FIX #6] Добавлен параметр MAX_STRUCTURE_MOVE_PCT (1.5%).
+  Если импульс (max1 - min1) превышает порог, max1 сбрасывается,
+  структура ждёт новый max1, не входя в WAIT_ENTRY.
+- [PATCH 15] Лог при отказе кандидата в мин2/макс2 показывает обе проверки.
+- [LOGGING] В конце process_block выводится [STATE] LONG и [STATE] SHORT.
 
 v3:
 - MAX_DELTA_EXTREMES теперь безразмерный множитель k.
@@ -73,11 +75,16 @@ def _check_body_spike(buffer_df: pd.DataFrame, idx_point1: int, idx_point2: int,
     return False
 
 
+def _fmt_point(p):
+    return f"{p[1]:.1f}({p[0]})" if p else "None"
+
+
 def process_block(state, block_start, block, params, buffer_df=None):
     delta_price = params.get('DELTA_PRICE', 30)
     min_distance = params.get('MIN_DISTANCE_BARS', 5)
     max_delta_k = params.get('MAX_DELTA_EXTREMES', 4.0)
     min_body_ratio = params.get('MIN_BODY_RATIO', 0.3)
+    max_struct_pct = params.get('MAX_STRUCTURE_MOVE_PCT', 1.5) / 100.0
 
     logger.info(f"Обработка блока {block_start}-{block_start + 6}")
     extremes = get_block_extremes(block, min_body_ratio)
@@ -100,12 +107,26 @@ def process_block(state, block_start, block, params, buffer_df=None):
             else:
                 logger.info(f"LONG: условия WAIT_MIN1 не выполнены")
         elif state['long']['state'] == 'WAIT_MIN2':
-            if H_price > state['long']['max1'][1]:
-                state['long']['max1'] = (H_idx, H_price)
-                logger.info(f"LONG: обновлён макс1 до {H_price} (idx {H_idx})")
+            # [FIX #6] Проверка на слишком большой импульс
+            if state['long']['max1'] is None:
+                if H_price > state['long']['min1'][1]:
+                    state['long']['max1'] = (H_idx, H_price)
+                    logger.info(f"LONG: установлен новый макс1={H_price} (idx {H_idx}) после сброса")
+            elif H_price > state['long']['max1'][1]:
+                impulse_pct = (H_price - state['long']['min1'][1]) / state['long']['min1'][1]
+                if impulse_pct > max_struct_pct:
+                    logger.info(
+                        f"LONG: max1 превысил min1 на {impulse_pct*100:.2f}% "
+                        f"(> {max_struct_pct*100:.1f}%), сброс. Ждём новый max1."
+                    )
+                    state['long']['max1'] = None
+                else:
+                    state['long']['max1'] = (H_idx, H_price)
+                    logger.info(f"LONG: обновлён макс1 до {H_price} (idx {H_idx})")
+
             if L_price > state['long']['min1'][1]:
                 distance = L_idx - state['long']['min1'][0]
-                ref_idx = state['long']['max1'][0]
+                ref_idx = state['long']['max1'][0] if state['long']['max1'] else 0
                 ok_dist = distance >= min_distance
                 ok_idx = L_idx > ref_idx
                 logger.info(
@@ -149,12 +170,26 @@ def process_block(state, block_start, block, params, buffer_df=None):
             else:
                 logger.info(f"SHORT: условия WAIT_MAX1 не выполнены")
         elif state['short']['state'] == 'WAIT_MAX2':
-            if L_price < state['short']['min1'][1]:
-                state['short']['min1'] = (L_idx, L_price)
-                logger.info(f"SHORT: обновлён мин1 до {L_price} (idx {L_idx})")
+            # [FIX #6] Проверка на слишком большой импульс
+            if state['short']['min1'] is None:
+                if L_price < state['short']['max1'][1]:
+                    state['short']['min1'] = (L_idx, L_price)
+                    logger.info(f"SHORT: установлен новый мин1={L_price} (idx {L_idx}) после сброса")
+            elif L_price < state['short']['min1'][1]:
+                impulse_pct = (state['short']['max1'][1] - L_price) / state['short']['max1'][1]
+                if impulse_pct > max_struct_pct:
+                    logger.info(
+                        f"SHORT: min1 упал от max1 на {impulse_pct*100:.2f}% "
+                        f"(> {max_struct_pct*100:.1f}%), сброс. Ждём новый min1."
+                    )
+                    state['short']['min1'] = None
+                else:
+                    state['short']['min1'] = (L_idx, L_price)
+                    logger.info(f"SHORT: обновлён мин1 до {L_price} (idx {L_idx})")
+
             if H_price < state['short']['max1'][1]:
                 distance = H_idx - state['short']['max1'][0]
-                ref_idx = state['short']['min1'][0]
+                ref_idx = state['short']['min1'][0] if state['short']['min1'] else 0
                 ok_dist = distance >= min_distance
                 ok_idx = H_idx > ref_idx
                 logger.info(
@@ -186,6 +221,20 @@ def process_block(state, block_start, block, params, buffer_df=None):
                 logger.info("SHORT: H == макс1, сброс")
                 state['short']['state'] = 'WAIT_MAX1'
                 state['short']['max1'] = state['short']['min1'] = None
+
+    # [LOGGING] Состояние искателей для debug.log
+    logger.info(
+        f"[STATE] LONG {state['long']['state']} "
+        f"min1={_fmt_point(state['long']['min1'])} "
+        f"max1={_fmt_point(state['long']['max1'])} "
+        f"min2={_fmt_point(state['long']['min2'])}"
+    )
+    logger.info(
+        f"[STATE] SHORT {state['short']['state']} "
+        f"max1={_fmt_point(state['short']['max1'])} "
+        f"min1={_fmt_point(state['short']['min1'])} "
+        f"max2={_fmt_point(state['short']['max2'])}"
+    )
 
 
 def check_entry(state, current_idx, current_candle, params):
