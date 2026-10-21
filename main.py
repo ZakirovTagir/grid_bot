@@ -108,7 +108,8 @@ for mod_name in ("core.swing_finder", "core.order_manager"):
 # Подавление шума системных библиотек (оставляем только WARNING и выше)
 for noisy in ("telegram", "telegram.ext", "telegram.ext.ExtBot",
               "telegram.ext.Updater", "telegram.ext.Application",
-              "httpx", "httpcore", "pybit", "urllib3", "asyncio"):
+              "httpx", "httpcore", "pybit", "urllib3", "asyncio",
+              "yadisk", "utils.yadisk_sync"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
